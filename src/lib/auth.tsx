@@ -18,18 +18,31 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 /**
- * Session-based auth: uses sessionStorage so closing the tab/browser logs the user out.
- * Also stores in localStorage for tab-duplication support, but clears on beforeunload.
+ * Persistent & cross-tab resilient session auth:
+ * Keeps token/user synchronized in both sessionStorage and localStorage so
+ * tab restores, fullscreen transitions, background mobile discards, or transient
+ * API blips never cause unexpected automatic logouts. Explicit logout clears both.
  */
 function loadSession(): { token: string | null; user: User | null } {
-  // Scoped to sessionStorage only to prevent cross-tab session leakage and collisions
-  const savedToken = sessionStorage.getItem(TOKEN_KEY);
-  const savedUser = sessionStorage.getItem(USER_KEY);
+  let savedToken: string | null = null;
+  let savedUser: string | null = null;
+  try {
+    savedToken = sessionStorage.getItem(TOKEN_KEY) || localStorage.getItem(TOKEN_KEY);
+    savedUser = sessionStorage.getItem(USER_KEY) || localStorage.getItem(USER_KEY);
+  } catch {
+    return { token: null, user: null };
+  }
 
   if (savedToken && savedUser) {
     try {
       const parsed = JSON.parse(savedUser);
       if (parsed && (parsed.email || parsed.name)) {
+        try {
+          sessionStorage.setItem(TOKEN_KEY, savedToken);
+          sessionStorage.setItem(USER_KEY, savedUser);
+          localStorage.setItem(TOKEN_KEY, savedToken);
+          localStorage.setItem(USER_KEY, savedUser);
+        } catch {}
         return { token: savedToken, user: parsed };
       }
     } catch {
@@ -37,9 +50,12 @@ function loadSession(): { token: string | null; user: User | null } {
     }
   }
 
-  // Clean up sessionStorage only
-  sessionStorage.removeItem(TOKEN_KEY);
-  sessionStorage.removeItem(USER_KEY);
+  try {
+    sessionStorage.removeItem(TOKEN_KEY);
+    sessionStorage.removeItem(USER_KEY);
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(USER_KEY);
+  } catch {}
   return { token: null, user: null };
 }
 
@@ -50,23 +66,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [isLoading, setIsLoading] = useState(!!session.token);
 
   const login = useCallback((newToken: string, newUser: User) => {
-    // Store in sessionStorage only
-    sessionStorage.setItem(TOKEN_KEY, newToken);
-    sessionStorage.setItem(USER_KEY, JSON.stringify(newUser));
+    try {
+      sessionStorage.setItem(TOKEN_KEY, newToken);
+      sessionStorage.setItem(USER_KEY, JSON.stringify(newUser));
+      localStorage.setItem(TOKEN_KEY, newToken);
+      localStorage.setItem(USER_KEY, JSON.stringify(newUser));
+    } catch {}
     setToken(newToken);
     setUser(newUser);
     resetRealtimeAuth().catch(() => {});
   }, []);
 
   const logout = useCallback(() => {
-    sessionStorage.removeItem(TOKEN_KEY);
-    sessionStorage.removeItem(USER_KEY);
+    try {
+      sessionStorage.removeItem(TOKEN_KEY);
+      sessionStorage.removeItem(USER_KEY);
+      localStorage.removeItem(TOKEN_KEY);
+      localStorage.removeItem(USER_KEY);
+    } catch {}
     setToken(null);
     setUser(null);
     resetRealtimeAuth().catch(() => {});
   }, []);
 
-  // Validate session with Firebase and subscribe to updates (permissions, status)
+  // Validate session with backend and subscribe to updates (permissions, status)
   useEffect(() => {
     ensureDefaultAdmin().catch(() => {});
 
@@ -81,14 +104,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           logout();
           return;
         }
-        // Sync to sessionStorage only
-        sessionStorage.setItem(USER_KEY, JSON.stringify(serverUser));
+        try {
+          const serialized = JSON.stringify(serverUser);
+          sessionStorage.setItem(USER_KEY, serialized);
+          localStorage.setItem(USER_KEY, serialized);
+        } catch {}
         setUser(serverUser as User);
         setIsLoading(false);
       }
-    }, (err) => {
-      console.error('User subscription error:', err);
-      logout();
+    }, (err: any) => {
+      // NEVER auto-logout on transient network/5xx server errors; only logout on explicit 401/403
+      const isExplicitUnauthorized =
+        err?.status === 401 ||
+        err?.status === 403 ||
+        err?.code === 'UNAUTHORIZED' ||
+        err?.message === 'Unauthorized';
+      if (isExplicitUnauthorized) {
+        console.warn('Session expired or unauthorized, signing out:', err);
+        logout();
+      } else {
+        console.warn('Transient session check error (keeping active login):', err?.message || err);
+      }
       setIsLoading(false);
     });
 
@@ -99,7 +135,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(prev => {
       if (!prev) return null;
       const updated = { ...prev, ...partialUser };
-      sessionStorage.setItem(USER_KEY, JSON.stringify(updated));
+      try {
+        const serialized = JSON.stringify(updated);
+        sessionStorage.setItem(USER_KEY, serialized);
+        localStorage.setItem(USER_KEY, serialized);
+      } catch {}
       return updated;
     });
   }, []);

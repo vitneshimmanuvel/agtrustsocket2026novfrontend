@@ -144,6 +144,7 @@ export async function firebaseAdminLogin(email: string, password: string) {
 
 export async function firebaseGetMe(token: string) {
   let networkFailed = false;
+  let lastStatus = 0;
   try {
     const res = await fetch(apiUrl('/api/auth/me'), {
       headers: { 'Authorization': `Bearer ${token}` }
@@ -151,15 +152,18 @@ export async function firebaseGetMe(token: string) {
     if (res.ok) {
       return await res.json();
     }
+    lastStatus = res.status;
     if (res.status === 401 || res.status === 403) {
-      throw new Error('Unauthorized');
+      const authErr: any = new Error('Unauthorized');
+      authErr.status = res.status;
+      authErr.code = 'UNAUTHORIZED';
+      throw authErr;
     }
   } catch (e: any) {
-    if (e instanceof TypeError || e?.name === 'TypeError') {
-      networkFailed = true;
-    } else {
+    if (e?.code === 'UNAUTHORIZED' || e?.status === 401 || e?.status === 403) {
       throw e;
     }
+    networkFailed = true;
   }
 
   if (networkFailed && token && token.startsWith('mock_jwt_admin_')) {
@@ -190,7 +194,10 @@ export async function firebaseGetMe(token: string) {
     };
   }
 
-  throw new Error('Unauthorized');
+  const transientErr: any = new Error(lastStatus ? `Session check temporary error (${lastStatus})` : 'Network error checking session');
+  transientErr.status = lastStatus;
+  transientErr.code = 'TRANSIENT_ERROR';
+  throw transientErr;
 }
 
 export function subscribeToMe(
@@ -200,8 +207,14 @@ export function subscribeToMe(
 ) {
   let active = true;
   let currentUserId: string | null = null;
+  let lastRefreshAt = 0;
+  let inFlight = false;
 
-  const refresh = () => {
+  const refresh = (force = false) => {
+    const now = Date.now();
+    if (!force && (inFlight || now - lastRefreshAt < 30000)) return;
+    inFlight = true;
+    lastRefreshAt = now;
     firebaseGetMe(token)
       .then((res) => {
         if (!active) return;
@@ -210,10 +223,13 @@ export function subscribeToMe(
       })
       .catch((err) => {
         if (active) onError(err);
+      })
+      .finally(() => {
+        inFlight = false;
       });
   };
 
-  refresh();
+  refresh(true);
 
   // Live permission/status updates via Socket.IO & periodic check
   const socket = getSocket();
@@ -223,12 +239,12 @@ export function subscribeToMe(
       if (payload.user) {
         onUpdate(payload.user);
       } else {
-        refresh();
+        refresh(true);
       }
     }
   };
   socket.on('user:permissions-updated', onPermsUpdated);
-  const onFocus = () => refresh();
+  const onFocus = () => refresh(false);
   window.addEventListener('focus', onFocus);
 
   return () => {
@@ -262,7 +278,9 @@ export async function firebaseChangePassword(token: string, currentPassword: str
 function authHeaders(): Record<string, string> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   try {
-    const token = typeof sessionStorage !== 'undefined' ? sessionStorage.getItem('recordbook_token') : null;
+    const token =
+      (typeof sessionStorage !== 'undefined' ? sessionStorage.getItem('recordbook_token') : null) ||
+      (typeof localStorage !== 'undefined' ? localStorage.getItem('recordbook_token') : null);
     if (token) headers['Authorization'] = `Bearer ${token}`;
   } catch {}
   return headers;

@@ -40,6 +40,8 @@ interface OtherModalsProps {
   dropdownRect?: { top: number, bottom: number, left: number, width: number } | null;
   dateRect?: { top: number, bottom: number, left: number, width: number } | null;
   onAddDropdownOption?: (colId: number, newValue: string, entryId?: number) => void;
+  dropdownCurrentValue?: string;
+  onDropdownSelect?: (val: string) => void;
 }
 
 export function OtherModals(props: OtherModalsProps) {
@@ -246,7 +248,9 @@ export function OtherModals(props: OtherModalsProps) {
             <div className="dropdown-modal-list">
               {filteredOptions.length > 0 ? (
                 filteredOptions.map((opt: string, idx: number) => {
-                  const currentVal = dropdownEntryId ? localEntries.find((e) => e.id === dropdownEntryId)?.cells?.[dropdownColumnId?.toString() || ''] : '';
+                  const currentVal = props.dropdownCurrentValue !== undefined
+                    ? props.dropdownCurrentValue
+                    : (dropdownEntryId ? localEntries.find((e) => e.id === dropdownEntryId)?.cells?.[dropdownColumnId?.toString() || ''] : '');
                   // Strict single choice: compare directly with currentVal
                   const isSelected = currentVal === opt;
                   const col = columns?.find(c => c.id === dropdownColumnId);
@@ -263,7 +267,11 @@ export function OtherModals(props: OtherModalsProps) {
                           // Single select behavior: clicking a new option replaces the current one.
                           // If clicking the already selected option, we deselect it.
                           const newVal = isSelected ? '' : opt;
-                          handleCellChange(dropdownEntryId, dropdownColumnId.toString(), newVal);
+                          if (props.onDropdownSelect) {
+                            props.onDropdownSelect(newVal);
+                          } else {
+                            handleCellChange(dropdownEntryId, dropdownColumnId.toString(), newVal);
+                          }
                           setDropdownModal(false);
                         }
                       }}
@@ -305,7 +313,11 @@ export function OtherModals(props: OtherModalsProps) {
                 className="dropdown-clear-btn"
                 onClick={() => {
                   if (dropdownEntryId != null && dropdownColumnId != null) {
-                    handleCellChange(dropdownEntryId, dropdownColumnId.toString(), '');
+                    if (props.onDropdownSelect) {
+                      props.onDropdownSelect('');
+                    } else {
+                      handleCellChange(dropdownEntryId, dropdownColumnId.toString(), '');
+                    }
                     setDropdownModal(false);
                   }
                 }}

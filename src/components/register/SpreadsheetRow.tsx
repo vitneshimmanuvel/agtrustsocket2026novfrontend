@@ -102,10 +102,24 @@ const SplitTextInput = React.memo(({ idx, col, entry, visibleColumns, colIdx, to
   const isEditingLeftRef = useRef(false);
   const isEditingRightRef = useRef(false);
 
+  const latestSplitRef = useRef({ initialValue, entryId: entry.id, colId: col.id.toString(), handleCellChange, readOnly });
+  latestSplitRef.current = { initialValue, entryId: entry.id, colId: col.id.toString(), handleCellChange, readOnly };
+
   useEffect(() => { leftStateRef.current = leftState; }, [leftState]);
   useEffect(() => { rightStateRef.current = rightState; }, [rightState]);
   useEffect(() => { isEditingLeftRef.current = isEditingLeft; }, [isEditingLeft]);
   useEffect(() => { isEditingRightRef.current = isEditingRight; }, [isEditingRight]);
+
+  useEffect(() => {
+    return () => {
+      if (!latestSplitRef.current.readOnly && (isEditingLeftRef.current || isEditingRightRef.current)) {
+        const finalVal = leftStateRef.current + ' ||| ' + rightStateRef.current;
+        if (finalVal !== latestSplitRef.current.initialValue) {
+          latestSplitRef.current.handleCellChange(latestSplitRef.current.entryId, latestSplitRef.current.colId, finalVal);
+        }
+      }
+    };
+  }, [entry.id, col.id]);
 
   useEffect(() => {
     const [l, r] = typeof initialValue === 'string' && initialValue.includes(' ||| ') ? initialValue.split(' ||| ') : ['', ''];
@@ -460,10 +474,24 @@ const SplitCurrencyCell = React.memo(({ idx, col, entry, colIdx, totalRows, visi
   const isEditingLeftRef = useRef(false);
   const isEditingRightRef = useRef(false);
 
+  const latestSplitCurrRef = useRef({ rawValue, entryId: entry.id, colId: col.id.toString(), handleCellChange, readOnly });
+  latestSplitCurrRef.current = { rawValue, entryId: entry.id, colId: col.id.toString(), handleCellChange, readOnly };
+
   useEffect(() => { leftStateRef.current = leftState; }, [leftState]);
   useEffect(() => { rightStateRef.current = rightState; }, [rightState]);
   useEffect(() => { isEditingLeftRef.current = isEditingLeft; }, [isEditingLeft]);
   useEffect(() => { isEditingRightRef.current = isEditingRight; }, [isEditingRight]);
+
+  useEffect(() => {
+    return () => {
+      if (!latestSplitCurrRef.current.readOnly && (isEditingLeftRef.current || isEditingRightRef.current)) {
+        const finalVal = leftStateRef.current + ' ||| ' + rightStateRef.current;
+        if (finalVal !== latestSplitCurrRef.current.rawValue) {
+          latestSplitCurrRef.current.handleCellChange(latestSplitCurrRef.current.entryId, latestSplitCurrRef.current.colId, finalVal);
+        }
+      }
+    };
+  }, [entry.id, col.id]);
 
   useEffect(() => {
     const [l, r] = typeof rawValue === 'string' && rawValue.includes(' ||| ') ? rawValue.split(' ||| ') : ['', ''];
@@ -814,6 +842,8 @@ const CurrencyCell = React.memo(({ idx, col, entry, colIdx, totalRows, visibleCo
   const liveTypingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isLockedByOther = !!cellLock;
   const effectiveReadOnly = readOnly || isLockedByOther;
+  const latestCurrPropsRef = useRef({ rawValue, entryId: entry.id, colId: col.id.toString(), handleCellChange, effectiveReadOnly });
+  latestCurrPropsRef.current = { rawValue, entryId: entry.id, colId: col.id.toString(), handleCellChange, effectiveReadOnly };
 
   useEffect(() => {
     isEditingRef.current = editing;
@@ -827,9 +857,25 @@ const CurrencyCell = React.memo(({ idx, col, entry, colIdx, totalRows, visibleCo
   }, [rawValue, editing]);
 
   useEffect(() => {
+    const flushPendingCurrencyEdit = () => {
+      const snap = latestCurrPropsRef.current;
+      if (isEditingRef.current && !snap.effectiveReadOnly && valRef.current !== snap.rawValue) {
+        isEditingRef.current = false;
+        snap.handleCellChange(snap.entryId, snap.colId, valRef.current);
+      }
+    };
+    const onHide = () => {
+      if (document.visibilityState === 'hidden') flushPendingCurrencyEdit();
+    };
+    window.addEventListener('pagehide', flushPendingCurrencyEdit);
+    document.addEventListener('visibilitychange', onHide);
     return () => {
+      window.removeEventListener('pagehide', flushPendingCurrencyEdit);
+      document.removeEventListener('visibilitychange', onHide);
       if (liveTypingTimerRef.current) clearTimeout(liveTypingTimerRef.current);
-      if (isEditingRef.current && registerId !== undefined) {
+      const wasEditing = isEditingRef.current;
+      flushPendingCurrencyEdit();
+      if (wasEditing && registerId !== undefined) {
         emitCellBlur(registerId, entry.id, String(col.id));
       }
     };
@@ -1043,15 +1089,33 @@ const SpreadsheetTextInput = React.memo(({ idx, col, entry, visibleColumns, colI
 
   const isLockedByOther = !!cellLock;
   const effectiveReadOnly = readOnly || isLockedByOther;
+  const latestTextPropsRef = useRef({ initialValue, entryId: entry.id, colId: col.id.toString(), handleCellChange, effectiveReadOnly });
+  latestTextPropsRef.current = { initialValue, entryId: entry.id, colId: col.id.toString(), handleCellChange, effectiveReadOnly };
 
   useEffect(() => {
     isEditingRef.current = isEditing;
   }, [isEditing]);
 
   useEffect(() => {
+    const flushPendingTextEdit = () => {
+      const snap = latestTextPropsRef.current;
+      if (isEditingRef.current && !snap.effectiveReadOnly && valRef.current !== snap.initialValue) {
+        isEditingRef.current = false;
+        snap.handleCellChange(snap.entryId, snap.colId, valRef.current);
+      }
+    };
+    const onHide = () => {
+      if (document.visibilityState === 'hidden') flushPendingTextEdit();
+    };
+    window.addEventListener('pagehide', flushPendingTextEdit);
+    document.addEventListener('visibilitychange', onHide);
     return () => {
+      window.removeEventListener('pagehide', flushPendingTextEdit);
+      document.removeEventListener('visibilitychange', onHide);
       if (liveTypingTimerRef.current) clearTimeout(liveTypingTimerRef.current);
-      if (isEditingRef.current && registerId !== undefined) {
+      const wasEditing = isEditingRef.current;
+      flushPendingTextEdit();
+      if (wasEditing && registerId !== undefined) {
         emitCellBlur(registerId, entry.id, String(col.id));
       }
     };

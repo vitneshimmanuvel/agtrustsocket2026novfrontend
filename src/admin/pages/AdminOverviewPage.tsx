@@ -8,14 +8,14 @@ import {
   firebaseGetPendingDownloadRequests,
   firebaseRespondRequest
 } from '../../lib/firebaseAuth';
-import { listBusinesses, listRegisters, deleteRegister, listDeletedRegisters, getAllDeletedItems, getRegister, type RegisterSummary, type Column, type Entry, listSavedShortcuts, createSavedShortcut, deleteSavedShortcut, type SavedRegisterShortcut, renameSavedShortcut, evaluateFormula, getDashboardConfig, saveDashboardConfig } from '../../lib/api';
+import { listBusinesses, listRegisters, deleteRegister, listDeletedRegisters, getAllDeletedItems, getRegister, updateEntryDirect, type RegisterSummary, type Column, type Entry, listSavedShortcuts, createSavedShortcut, deleteSavedShortcut, type SavedRegisterShortcut, renameSavedShortcut, evaluateFormula, getDashboardConfig, saveDashboardConfig } from '../../lib/api';
 import { cleanActivityLogs } from '../../lib/activityHelper';
 import {
   LayoutDashboard, Users, Activity, ShieldAlert, FileSpreadsheet,
   RefreshCw, TrendingUp, UserCheck, Calendar, ArrowRight, ArrowLeft, UserPlus,
   Clock, CheckCircle, XCircle, Trash2, Download, MessageSquare, Send,
   Search, X, Filter, ChevronDown, ChevronUp, Eye, Hash, Folder,
-  Maximize2, Minimize2, Database, Columns, Plus, Bookmark, MoreVertical
+  Maximize2, Minimize2, Database, Columns, Plus, Bookmark, MoreVertical, ExternalLink
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { formatCurrency } from '../../lib/formatters';
@@ -829,6 +829,10 @@ export default function AdminOverviewPage({ onNavigateTab }: { onNavigateTab: (t
         initialSearch={initialSearch}
         initialFilters={initialFilters}
         onSaveShortcut={handleSaveShortcut}
+        onUpdateEntry={(entryId, cells) => {
+          setDetailEntries(prev => prev.map(e => String(e.id) === String(entryId) ? { ...e, cells: { ...(e.cells || {}), ...cells } } : e));
+        }}
+        onOpenFullSheet={(regId) => navigate(`/register/${regId}`)}
         onClose={() => { setDetailReg(null); setDetailColumns([]); setDetailEntries([]); setInitialSearch(''); setInitialFilters([]); }}
       />
     );
@@ -3020,7 +3024,9 @@ function RegisterDetailPanel({
   detailReg, detailLoading, detailColumns, detailEntries, onClose,
   initialSearch = '',
   initialFilters = [],
-  onSaveShortcut
+  onSaveShortcut,
+  onUpdateEntry,
+  onOpenFullSheet
 }: {
   detailReg: { id: number; name: string };
   detailLoading: boolean;
@@ -3030,12 +3036,37 @@ function RegisterDetailPanel({
   initialSearch?: string;
   initialFilters?: Array<{ columnId: number; operator: string; value: string; value2?: string; values?: string[] }>;
   onSaveShortcut: (name: string, searchQuery: string, filters: any[]) => void;
+  onUpdateEntry?: (entryId: number, cells: Record<string, string>) => void;
+  onOpenFullSheet?: (registerId: number) => void;
 }) {
   const [showFilterPanel, setShowFilterPanel] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [isFullScreen, setIsFullScreen] = useState(false);
   const [isSearchExpanded, setIsSearchExpanded] = useState(!!initialSearch);
   const [showExportMenu, setShowExportMenu] = useState(false);
+  const [editingCell, setEditingCell] = useState<{ entryId: number; colId: number } | null>(null);
+  const [editingValue, setEditingValue] = useState('');
+  const [savingCellKey, setSavingCellKey] = useState<string | null>(null);
+
+  const commitDetailCellEdit = async (entry: Entry, col: Column, nextVal: string) => {
+    const colKey = col.id.toString();
+    const prevVal = entry.cells?.[colKey] || '';
+    setEditingCell(null);
+    if (nextVal === prevVal) return;
+
+    const key = `${entry.id}-${colKey}`;
+    setSavingCellKey(key);
+    onUpdateEntry?.(entry.id, { [colKey]: nextVal });
+    try {
+      await updateEntryDirect(detailReg.id, entry.id, { [colKey]: nextVal });
+      toast.success(`Saved ${col.name}`, { id: `admin-cell-save`, duration: 1500 });
+    } catch (err: any) {
+      onUpdateEntry?.(entry.id, { [colKey]: prevVal });
+      toast.error(`Failed to save ${col.name}: ${err?.message || 'Error'}`);
+    } finally {
+      setSavingCellKey(null);
+    }
+  };
 
   // Local states to avoid rendering parent component on every keystroke
   const [detailSearch, setDetailSearch] = useState(initialSearch);
@@ -3591,6 +3622,31 @@ function RegisterDetailPanel({
             )}
           </div>
 
+          {/* Open in Full Register Sheet */}
+          {onOpenFullSheet && (
+            <button
+              onClick={() => onOpenFullSheet(detailReg.id)}
+              title="Open Editable Sheet"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '5px',
+                background: 'rgba(16, 185, 129, 0.08)',
+                border: '1.5px solid rgba(16, 185, 129, 0.25)',
+                cursor: 'pointer',
+                color: '#059669',
+                padding: '6px 10px',
+                borderRadius: '8px',
+                fontSize: '12px',
+                fontWeight: 700,
+                transition: 'all 0.15s',
+                boxSizing: 'border-box'
+              }}
+            >
+              <ExternalLink size={14} /> Open Sheet
+            </button>
+          )}
+
           {/* Full Screen Toggle */}
           <button
             onClick={() => setIsFullScreen(v => !v)}
@@ -3854,15 +3910,75 @@ function RegisterDetailPanel({
                       zIndex: 1, borderRight: '1px solid var(--border-light)'
                     }}>{globalIdx}</td>
                     {detailColumns.map(col => {
-                      const val = entry.cells?.[col.id.toString()] || '';
+                      const colKey = col.id.toString();
+                      const val = entry.cells?.[colKey] || '';
                       const isDropdown = col.type === 'dropdown';
+                      const isTargetLinked = col.linkedTo?.role === 'target' || (Array.isArray((col as any).linkedTargets) && (col as any).linkedTargets.some((l: any) => l.role === 'target'));
+                      const isCellEditable = col.type !== 'formula' && col.type !== 'auto_increment' && col.type !== 'image' && col.type !== 'signature' && !isTargetLinked && Number.isInteger(entry.id);
+                      const isEditingThis = editingCell?.entryId === entry.id && editingCell?.colId === col.id;
+                      const isSavingThis = savingCellKey === `${entry.id}-${colKey}`;
                       return (
-                        <td key={col.id} style={{
-                          padding: '8px 14px', color: 'var(--foreground)', maxWidth: '280px',
-                          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                          borderRight: '1px solid var(--border-light)', fontSize: '12.5px'
-                        }} title={val}>
-                          {isDropdown && val ? (
+                        <td
+                          key={col.id}
+                          onDoubleClick={() => {
+                            if (isCellEditable) {
+                              setEditingCell({ entryId: entry.id, colId: col.id });
+                              setEditingValue(val);
+                            }
+                          }}
+                          style={{
+                            padding: isEditingThis ? '3px 6px' : '8px 14px', color: 'var(--foreground)', maxWidth: '280px',
+                            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                            borderRight: '1px solid var(--border-light)', fontSize: '12.5px',
+                            cursor: isCellEditable ? 'cell' : 'default',
+                            background: isSavingThis ? 'rgba(16, 185, 129, 0.06)' : undefined
+                          }}
+                          title={isCellEditable ? `${val ? val + ' — ' : ''}Double-click to edit` : val}
+                        >
+                          {isEditingThis ? (
+                            isDropdown && Array.isArray(col.dropdownOptions) && col.dropdownOptions.length > 0 ? (
+                              <select
+                                autoFocus
+                                value={editingValue}
+                                onChange={(e) => commitDetailCellEdit(entry, col, e.target.value)}
+                                onBlur={() => setEditingCell(null)}
+                                onKeyDown={(e) => { if (e.key === 'Escape') setEditingCell(null); }}
+                                style={{
+                                  width: '100%', padding: '5px 8px', borderRadius: '6px',
+                                  border: '1.5px solid var(--accent)', fontSize: '12.5px',
+                                  background: 'var(--background)', color: 'var(--foreground)', outline: 'none'
+                                }}
+                              >
+                                <option value="">-- Clear --</option>
+                                {col.dropdownOptions.map(opt => (
+                                  <option key={opt} value={opt}>{opt}</option>
+                                ))}
+                              </select>
+                            ) : (
+                              <input
+                                autoFocus
+                                type="text"
+                                value={editingValue}
+                                onChange={(e) => setEditingValue(e.target.value)}
+                                onBlur={() => commitDetailCellEdit(entry, col, editingValue)}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') {
+                                    e.preventDefault();
+                                    commitDetailCellEdit(entry, col, editingValue);
+                                  } else if (e.key === 'Escape') {
+                                    e.preventDefault();
+                                    setEditingCell(null);
+                                  }
+                                }}
+                                style={{
+                                  width: '100%', padding: '5px 8px', borderRadius: '6px',
+                                  border: '1.5px solid var(--accent)', fontSize: '12.5px',
+                                  background: 'var(--background)', color: 'var(--foreground)', outline: 'none',
+                                  boxSizing: 'border-box'
+                                }}
+                              />
+                            )
+                          ) : isDropdown && val ? (
                             <span style={{ padding: '2px 8px', borderRadius: '4px', background: 'rgba(99,102,241,0.06)', color: '#6366f1', fontWeight: 600, fontSize: '11px' }}>{val}</span>
                           ) : val}
                         </td>

@@ -1,11 +1,11 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { 
   Clock, FileText, Download, X, Plus, AlertCircle, 
   Image as ImageIcon, FlaskConical, ChevronDown, Maximize2, 
   ListOrdered, Globe, Phone, Mail,
   Link as LinkIcon, Lock as LockIcon, PenTool, Paperclip, ZoomIn, ZoomOut, Eraser, User, Eye, EyeOff
 } from 'lucide-react';
-import { type Entry, listRowHistory, updateEntry } from '../../../lib/api';
+import { type Entry, listRowHistory, updateEntry, formatDateToDDMMYYYY, getColumnLinks } from '../../../lib/api';
 import { ImageCompressionModule } from '../../../lib/imageCompressionModule';
 import { SignatureModal } from './SignatureModal';
 import toast from 'react-hot-toast';
@@ -42,7 +42,7 @@ interface RowDetailModalProps {
   setNewColDropdownOpts: (opts: string) => void;
   setNewColMinVal: (v: string) => void;
   setNewColMaxVal: (v: string) => void;
-  openDropdown: (entryId: number, columnId: number, options: string[], rect: DOMRect) => void;
+  openDropdown: (entryId: number, columnId: number, options: string[], rect: DOMRect, currentVal?: string, onSelect?: (val: string) => void) => void;
   openDatePicker: (entryId: number, columnId: number, value: string, rect: DOMRect) => void;
   canSelectBackDates?: boolean;
   queryClient: any;
@@ -124,6 +124,13 @@ export const RowDetailModal = React.memo(function RowDetailModal({
   const [showAttachmentsGallery, setShowAttachmentsGallery] = useState(false);
   const [galleryZoomIdx, setGalleryZoomIdx] = useState<number | null>(null);
   const [revealedHiddenCols, setRevealedHiddenCols] = useState<Record<string, boolean>>({});
+  const [confirmClearAll, setConfirmClearAll] = useState(false);
+  const [clearedAllPending, setClearedAllPending] = useState(false);
+
+  useEffect(() => {
+    setConfirmClearAll(false);
+    setClearedAllPending(false);
+  }, [detailViewEntry.id]);
 
   const isRowEditable = !_canEditAny ? false : (!_rowEditRange ? true : (() => {
     const num = detailViewEntry.rowNumber;
@@ -317,13 +324,24 @@ export const RowDetailModal = React.memo(function RowDetailModal({
                           if (e.key === 'Enter' || e.key === ' ') {
                             e.preventDefault();
                             const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                            openDropdown(detailViewEntry.id, col.id, col.dropdownOptions || [], rect as DOMRect);
+                            let opts = col.dropdownOptions || [];
+                            if (col.type === 'yes_no' && opts.length === 0) opts = ['Yes', 'No'];
+                            if (col.type === 'status' && opts.length === 0) opts = ['Pending', 'In Progress', 'Completed', 'Cancelled'];
+                            openDropdown(detailViewEntry.id, col.id, opts, rect as DOMRect, val, (selected) => {
+                              setDetailEdits(prev => ({ ...prev, [colKey]: selected }));
+                              if (detailErrors[colKey]) setDetailErrors(prev => ({ ...prev, [colKey]: null }));
+                            });
                           } else handleDetailKeyDown(e, col.id);
                         }}
                         onClick={isFieldEditable ? (e) => {
                           const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                          openDropdown(detailViewEntry.id, col.id, col.dropdownOptions || [], rect as DOMRect);
-                          if (detailErrors[colKey]) setDetailErrors(prev => ({ ...prev, [colKey]: null }));
+                          let opts = col.dropdownOptions || [];
+                          if (col.type === 'yes_no' && opts.length === 0) opts = ['Yes', 'No'];
+                          if (col.type === 'status' && opts.length === 0) opts = ['Pending', 'In Progress', 'Completed', 'Cancelled'];
+                          openDropdown(detailViewEntry.id, col.id, opts, rect as DOMRect, val, (selected) => {
+                            setDetailEdits(prev => ({ ...prev, [colKey]: selected }));
+                            if (detailErrors[colKey]) setDetailErrors(prev => ({ ...prev, [colKey]: null }));
+                          });
                         } : undefined}
                       >
                         {val || 'Select options...'}
@@ -641,78 +659,120 @@ export const RowDetailModal = React.memo(function RowDetailModal({
         </div>
 
         <div className="row-detail-footer">
-          <button className="row-detail-btn-close" onClick={() => { setDetailViewEntry(null); setDetailEdits({}); setDetailErrors({}); setShowRowAuditTrail(false); setRowAuditHistory([]); }}>{isRowEditable ? 'Cancel' : 'Close'}</button>
+          <button className="row-detail-btn-close" onClick={() => { setConfirmClearAll(false); setClearedAllPending(false); setDetailViewEntry(null); setDetailEdits({}); setDetailErrors({}); setShowRowAuditTrail(false); setRowAuditHistory([]); }}>{isRowEditable ? 'Cancel' : 'Close'}</button>
           {isRowEditable && (
-            <button
-              className="row-detail-btn-close"
-              style={{ color: '#dc2626', borderColor: '#fecaca', background: '#fef2f2', display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '13px', fontWeight: 600 }}
-              title="Clear all field values in this row"
-              onClick={() => {
-                if (!confirm('Are you sure you want to clear all fields in this row? This will empty every editable field. You can still cancel without saving.')) return;
-                const cleared: Record<string, string> = {};
-                modalColumns.forEach(col => {
-                  if (col.type === 'formula' || col.type === 'auto_increment') return;
-                  const isTargetLinked = col.linkedTo && col.linkedTo.role === 'target';
-                  if (isTargetLinked) return;
-                  if (_editableColumnIds && !_editableColumnIds.has(col.id)) return;
-                  if (detailViewEntry.cellStyles?.[col.id.toString()]?.hidden && !revealedHiddenCols[col.id.toString()]) return;
-                  cleared[col.id.toString()] = '';
-                });
-                setDetailEdits(prev => ({ ...prev, ...cleared }));
-                setDetailErrors({});
-                toast.success('All fields cleared. Click "Save Changes" to persist or "Cancel" to undo.');
-              }}
-            >
-              <Eraser size={14} /> Clear All
-            </button>
+            confirmClearAll ? (
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', padding: '4px 8px', borderRadius: '8px', background: '#fef2f2', border: '1px solid #fecaca' }}>
+                <span style={{ fontSize: '12px', fontWeight: 600, color: '#991b1b' }}>Clear all entries?</span>
+                <button
+                  type="button"
+                  className="row-detail-btn-close"
+                  style={{ color: '#ffffff', borderColor: '#dc2626', background: '#dc2626', fontSize: '12px', fontWeight: 700, padding: '5px 10px' }}
+                  onClick={() => {
+                    const cleared: Record<string, string> = {};
+                    modalColumns.forEach(col => {
+                      if (col.type === 'formula' || col.type === 'auto_increment') return;
+                      const isTargetLinked = getColumnLinks(col).some(l => l.role === 'target');
+                      if (isTargetLinked) return;
+                      if (_editableColumnIds && !_editableColumnIds.has(col.id)) return;
+                      if (detailViewEntry.cellStyles?.[col.id.toString()]?.hidden && !revealedHiddenCols[col.id.toString()]) return;
+                      cleared[col.id.toString()] = '';
+                    });
+                    setDetailEdits(prev => ({ ...prev, ...cleared }));
+                    setDetailErrors({});
+                    setConfirmClearAll(false);
+                    setClearedAllPending(true);
+                    toast.success('All editable entries cleared. Click "Save Changes" to save.');
+                  }}
+                >
+                  Confirm
+                </button>
+                <button
+                  type="button"
+                  className="row-detail-btn-close"
+                  style={{ fontSize: '12px', padding: '5px 10px' }}
+                  onClick={() => setConfirmClearAll(false)}
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                className="row-detail-btn-close"
+                style={{ color: '#dc2626', borderColor: '#fecaca', background: '#fef2f2', display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '13px', fontWeight: 600 }}
+                title="Clear all field values in this row"
+                onClick={() => setConfirmClearAll(true)}
+              >
+                <Eraser size={14} /> Clear All
+              </button>
+            )
           )}
           {isRowEditable && (
             <button 
               className="row-detail-btn-save" 
               disabled={isSaving}
               onClick={async () => {
-                const errors: Record<string, string | null> = {};
-                let hasErrors = false;
+                const normalizedEdits: Record<string, string> = { ...detailEdits };
+                const changedCells: Record<string, string> = {};
 
                 modalColumns.forEach(col => {
-                  const val = detailEdits[col.id.toString()] ?? detailViewEntry.cells?.[col.id.toString()] ?? '';
-                  
-                  if ((col as any).mandatory && col.type !== 'formula' && col.type !== 'auto_increment' && val.trim() === '') {
-                    errors[col.id.toString()] = "This field is mandatory and cannot be empty.";
-                    hasErrors = true;
-                  } else if ((col as any).unique && val.trim() !== '') {
-                    const isDuplicate = localEntriesRef.current.some(
-                      e => e.id !== detailViewEntry.id && e.cells?.[col.id.toString()]?.trim().toLowerCase() === val.trim().toLowerCase()
-                    );
-                    if (isDuplicate) {
-                      errors[col.id.toString()] = `Unique field: The value "${val}" already exists.`;
-                      hasErrors = true;
-                    }
-                  } 
-                  
-                  if (!errors[col.id.toString()]) {
-                    const validation = validateCellValue(col, val);
-                    if (!validation.isValid && val.trim() !== '') {
-                      errors[col.id.toString()] = validation.error;
-                      hasErrors = true;
-                    }
+                  const colId = col.id.toString();
+                  if (!(colId in normalizedEdits)) return;
+                  let value = normalizedEdits[colId] ?? '';
+                  if (col.type === 'date' && value.trim() !== '') {
+                    value = formatDateToDDMMYYYY(value);
+                    normalizedEdits[colId] = value;
                   }
-                });
-
-                const hadErrorsBefore = Object.keys(detailErrors || {}).length > 0;
-                setDetailErrors(errors);
-
-                if (hasErrors && !hadErrorsBefore) {
-                  toast("Some entries have formatting warnings. Click save again to confirm.", { icon: '⚠️' });
-                  return;
-                }
-
-                const changedCells: Record<string, string> = {};
-                Object.entries(detailEdits).forEach(([colId, value]) => {
-                  if (detailViewEntry.cells?.[colId] !== value) {
+                  const origVal = detailViewEntry.cells?.[colId] ?? '';
+                  if (origVal !== value) {
                     changedCells[colId] = value;
                   }
                 });
+
+                const errors: Record<string, string | null> = {};
+                let hasBlockingError = false;
+                let warningCount = 0;
+
+                modalColumns.forEach(col => {
+                  const colId = col.id.toString();
+                  const val = normalizedEdits[colId] ?? detailViewEntry.cells?.[colId] ?? '';
+                  const isChanged = colId in changedCells;
+
+                  if (!isChanged) return;
+
+                  if ((col as any).unique && val.trim() !== '') {
+                    const isDuplicate = localEntriesRef.current.some(
+                      e => String(e.id) !== String(detailViewEntry.id) && e.cells?.[colId]?.trim().toLowerCase() === val.trim().toLowerCase()
+                    );
+                    if (isDuplicate) {
+                      errors[colId] = `Unique field: The value "${val}" already exists.`;
+                      hasBlockingError = true;
+                    }
+                  } else if ((col as any).mandatory && !clearedAllPending && col.type !== 'formula' && col.type !== 'auto_increment' && val.trim() === '' && (detailViewEntry.cells?.[colId] ?? '').trim() !== '') {
+                    errors[colId] = "This field is mandatory and cannot be empty.";
+                    warningCount++;
+                  }
+
+                  if (!errors[colId] && val.trim() !== '') {
+                    const validation = validateCellValue(col, val);
+                    if (!validation.isValid) {
+                      errors[colId] = validation.error;
+                      warningCount++;
+                    }
+                  }
+                });
+
+                setDetailErrors(errors);
+
+                if (hasBlockingError) {
+                  toast.error("Cannot save: a unique field value already exists in another record.");
+                  return;
+                }
+
+                if (warningCount > 0) {
+                  toast("Saved with formatting notes.", { icon: '⚠️' });
+                }
 
                 if (Object.keys(changedCells).length > 0) {
                   if (!Number.isInteger(detailViewEntry.id)) {
@@ -720,8 +780,17 @@ export const RowDetailModal = React.memo(function RowDetailModal({
                       ...(pendingTempRowEdits.current[detailViewEntry.id] || {}),
                       ...changedCells
                     };
+                    setLocalEntries(prev => {
+                      const next = prev.map(e =>
+                        e.id === detailViewEntry.id ? { ...e, cells: { ...e.cells, ...changedCells } } : e
+                      );
+                      localEntriesRef.current = next;
+                      return next;
+                    });
                     toast.success("Changes buffered. Saving to database once the row is created.");
-                    
+
+                    setConfirmClearAll(false);
+                    setClearedAllPending(false);
                     setDetailViewEntry(null);
                     setDetailEdits({});
                     setDetailErrors({});
@@ -730,9 +799,13 @@ export const RowDetailModal = React.memo(function RowDetailModal({
                     return;
                   }
 
-                  setLocalEntries(prev => prev.map(e => 
-                    e.id === detailViewEntry.id ? { ...e, cells: { ...e.cells, ...changedCells } } : e
-                  ));
+                  setLocalEntries(prev => {
+                    const next = prev.map(e =>
+                      e.id === detailViewEntry.id ? { ...e, cells: { ...e.cells, ...changedCells } } : e
+                    );
+                    localEntriesRef.current = next;
+                    return next;
+                  });
 
                   Object.keys(changedCells).forEach(colId => {
                     const key = `${detailViewEntry.id}-${colId}`;
@@ -741,7 +814,7 @@ export const RowDetailModal = React.memo(function RowDetailModal({
                       delete debounceTimers.current[key];
                     }
                   });
-                  queryClient.setQueryData(['register', String(registerId)], (old: any) => {
+                  const applyChangedToCache = (old: any) => {
                     if (!old || !Array.isArray(old.entries)) return old;
                     return {
                       ...old,
@@ -749,37 +822,39 @@ export const RowDetailModal = React.memo(function RowDetailModal({
                         e.id === detailViewEntry.id ? { ...e, cells: { ...e.cells, ...changedCells } } : e
                       ),
                     };
-                  });
+                  };
+                  queryClient.setQueryData(['register', Number(registerId)], applyChangedToCache);
+                  queryClient.setQueryData(['register', String(registerId)], applyChangedToCache);
 
                   setIsSaving(true);
-                  updateEntry(registerId, detailViewEntry.id, changedCells).then(() => {
+                  try {
+                    await updateEntry(registerId, detailViewEntry.id, changedCells);
+                    queryClient.setQueryData(['register', Number(registerId)], applyChangedToCache);
+                    queryClient.setQueryData(['register', String(registerId)], applyChangedToCache);
                     Object.keys(changedCells).forEach(colId => {
                       const col = columnsRef.current.find(c => c.id.toString() === colId);
-                      if (col?.linkedTo) {
-                        queryClient.invalidateQueries({ queryKey: ['register', col.linkedTo.registerId] });
+                      if (col) {
+                        getColumnLinks(col).filter(l => l.role === 'source').forEach(l => {
+                          queryClient.invalidateQueries({ queryKey: ['register', Number(l.registerId)] });
+                          queryClient.invalidateQueries({ queryKey: ['register', String(l.registerId)] });
+                        });
                       }
                     });
-                    
-                    queryClient.setQueryData(['register', registerId], (old: any) => {
-                      if (!old) return old;
-                      return {
-                        ...old,
-                        entries: old.entries.map((e: any) =>
-                          e.id === detailViewEntry.id ? { ...e, cells: { ...e.cells, ...changedCells } } : e
-                        ),
-                      };
-                    });
                     toast.success("Changes saved successfully!");
-                  }).catch(err => {
+                  } catch (err) {
                     console.error("Failed to save:", err);
                     toast.error("Failed to save changes. Please check your connection.");
-                  }).finally(() => {
                     setIsSaving(false);
-                  });
+                    return;
+                  } finally {
+                    setIsSaving(false);
+                  }
                 } else {
                   toast.success("No changes to save.");
                 }
-                
+
+                setConfirmClearAll(false);
+                setClearedAllPending(false);
                 setDetailViewEntry(null);
                 setDetailEdits({});
                 setDetailErrors({});
@@ -787,7 +862,7 @@ export const RowDetailModal = React.memo(function RowDetailModal({
                 setRowAuditHistory([]);
               }}
             >
-              Save Changes
+              {isSaving ? 'Saving…' : 'Save Changes'}
             </button>
           )}
         </div>

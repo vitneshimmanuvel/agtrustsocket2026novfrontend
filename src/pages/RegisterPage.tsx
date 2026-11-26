@@ -389,6 +389,7 @@ return () => document.removeEventListener('mousedown', handleOutsideClick);
   const [uploadingCells, setUploadingCells] = useState<Record<string, boolean>>({});
   const [pendingDebounceCount, setPendingDebounceCount] = useState(0);
   const pendingTempRowEdits = useRef<Record<number, Record<string, string>>>({});
+  const promotedTempEditsRef = useRef<Map<string, Record<string, string>>>(new Map());
   const pendingTempIdQueueRef = useRef<number[]>([]);
   const ownTempIdsRef = useRef<Set<number>>(new Set());
   const tempRowCounterRef = useRef<number>(0);
@@ -496,11 +497,13 @@ return () => document.removeEventListener('mousedown', handleOutsideClick);
   const detailViewEntryIdRef = useRef<number | null>(null);
   const scrollToRowIdRef = useRef<number | null>(null);
   useEffect(() => {
-    detailViewEntryIdRef.current = detailViewEntry?.id || null;
-    if (detailViewEntry) {
-      setDetailEdits(detailViewEntry.cells || {});
+    const nextId = detailViewEntry?.id || null;
+    if (nextId !== null && detailViewEntryIdRef.current !== nextId) {
+      detailViewEntryIdRef.current = nextId;
+      setDetailEdits(detailViewEntry?.cells || {});
       setDetailErrors({});
-    } else {
+    } else if (nextId === null) {
+      detailViewEntryIdRef.current = null;
       setDetailEdits({});
       setDetailErrors({});
     }
@@ -600,6 +603,8 @@ return () => document.removeEventListener('mousedown', handleOutsideClick);
   const dropdownEntryIdRef = useRef<number | null>(null);
   const dropdownColumnIdRef = useRef<number | null>(null);
   const dropdownRectRef = useRef<{ top: number, bottom: number, left: number, width: number } | null>(null);
+  const dropdownOnSelectRef = useRef<((val: string) => void) | null>(null);
+  const dropdownCurrentValRef = useRef<string | undefined>(undefined);
   const dropdownOptions = dropdownOptionsRef.current;
   const dropdownEntryId = dropdownEntryIdRef.current;
   const dropdownColumnId = dropdownColumnIdRef.current;
@@ -664,13 +669,11 @@ return () => document.removeEventListener('mousedown', handleOutsideClick);
   // ── Real-Time Multi-User Synchronization (Socket.IO — polling removed) ──
 
   useEffect(() => {
-    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
-      // Flush any pending debounced writes immediately before unloading
+    const flushPendingDebouncedEdits = () => {
       const timers = debounceTimers.current;
       const pendingKeys = Object.keys(timers);
       const hasPending = pendingKeys.length > 0 || pendingCellEditsRef.current.size > 0;
       if (hasPending) {
-        // Fire all pending debounced writes synchronously
         pendingKeys.forEach(key => {
           clearTimeout(timers[key]);
           delete timers[key];
@@ -678,18 +681,38 @@ return () => document.removeEventListener('mousedown', handleOutsideClick);
         setPendingDebounceCount(0);
         pendingCellEditsRef.current.forEach((diff, entryId) => {
           if (Object.keys(diff).length > 0) {
-            updateEntryDirect(registerId, entryId, diff);
+            updateEntryDirect(registerId, entryId, diff).catch(console.error);
           }
         });
         pendingCellEditsRef.current.clear();
       }
+      return hasPending;
+    };
+
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      const hasPending = flushPendingDebouncedEdits();
       if (isSaving || hasPending) {
         e.preventDefault();
         e.returnValue = '';
       }
     };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        flushPendingDebouncedEdits();
+      }
+    };
     window.addEventListener('beforeunload', handleBeforeUnload);
-    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+    window.addEventListener('pagehide', flushPendingDebouncedEdits);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener('pagehide', flushPendingDebouncedEdits);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      // Defer 1 tick after children unmount so SpreadsheetRow unmount flushes are included
+      queueMicrotask(() => {
+        flushPendingDebouncedEdits();
+      });
+    };
   }, [isSaving, registerId, queryClient]);
 
   // Stabilize references so child components only re-render when the actual data changes
@@ -2263,13 +2286,21 @@ return () => document.removeEventListener('mousedown', handleOutsideClick);
 
       // Check for pending edits made while the row was being saved
       let finalEntry = newEntry;
-      if (context?.tempId && pendingTempRowEdits.current[context.tempId]) {
-        const edits = pendingTempRowEdits.current[context.tempId];
+      const realKey = String(newEntry.id);
+      const savedTempEdits = context?.tempId ? pendingTempRowEdits.current[context.tempId] : undefined;
+      const alreadyPromotedEdits = promotedTempEditsRef.current.get(realKey);
+      const mergedTempEdits = { ...(alreadyPromotedEdits || {}), ...(savedTempEdits || {}) };
+      if (context?.tempId && savedTempEdits) {
         delete pendingTempRowEdits.current[context.tempId];
-        if (Object.keys(edits).length > 0) {
-          finalEntry = { ...newEntry, cells: { ...newEntry.cells, ...edits } };
-          updateEntryDirect(registerId, newEntry.id, edits).catch(console.error);
+        if (Object.keys(savedTempEdits).length > 0) {
+          promotedTempEditsRef.current.set(realKey, mergedTempEdits);
+          updateEntryDirect(registerId, newEntry.id, savedTempEdits).catch(console.error);
         }
+      } else if (alreadyPromotedEdits) {
+        promotedTempEditsRef.current.delete(realKey);
+      }
+      if (Object.keys(mergedTempEdits).length > 0) {
+        finalEntry = { ...newEntry, cells: { ...(newEntry.cells || {}), ...mergedTempEdits } };
       }
 
       // Replace temp entry with real entry from server
@@ -3008,8 +3039,10 @@ return () => document.removeEventListener('mousedown', handleOutsideClick);
 
             const col = columnsRef.current.find(c => c.id.toString() === columnId);
             if (col) {
-              getColumnLinks(col).forEach(l => {
-                queryClient.invalidateQueries({ queryKey: ['register', l.registerId] });
+              getColumnLinks(col).filter(l => l.role === 'source').forEach(l => {
+                // Only mark inactive caches stale; live mounted Split View / other tabs sync via real-time Ably events cleanly
+                queryClient.invalidateQueries({ queryKey: ['register', Number(l.registerId)], refetchType: 'inactive' });
+                queryClient.invalidateQueries({ queryKey: ['register', String(l.registerId)], refetchType: 'inactive' });
               });
             }
             const rowIdx = localEntriesRef.current.findIndex(e => Number(e.id) === numEntryId);
@@ -3279,10 +3312,13 @@ return () => document.removeEventListener('mousedown', handleOutsideClick);
     setDateModal(false);
   }, [dateDay, dateMonth, dateYear, dateEntryId, dateColumnId, columns, handleCellChange, validateCellValue]);
 
-  const openDropdown = useCallback((entryId: number, colId: number, options: string[], rect?: DOMRect) => {
+  const openDropdown = useCallback((entryId: number, colId: number, options: string[], rect?: DOMRect, currentVal?: string, onSelect?: (val: string) => void) => {
     dropdownEntryIdRef.current = entryId;
     dropdownColumnIdRef.current = colId;
     dropdownOptionsRef.current = options;
+    dropdownRectRef.current = rect ? { top: rect.top, bottom: rect.bottom, left: rect.left, width: rect.width } : null;
+    dropdownCurrentValRef.current = currentVal;
+    dropdownOnSelectRef.current = onSelect || null;
     setDropdownModal(true);
   }, []);
 
@@ -3538,6 +3574,7 @@ return () => document.removeEventListener('mousedown', handleOutsideClick);
             const pendingEdits = pendingTempRowEdits.current[matchedTempId];
             if (pendingEdits && Object.keys(pendingEdits).length > 0) {
               delete pendingTempRowEdits.current[matchedTempId];
+              promotedTempEditsRef.current.set(String(newEntry.id), pendingEdits);
               updateEntryDirect(Number(registerId), newEntry.id, pendingEdits).catch(console.error);
               next[tempIdx] = { ...newEntry, cells: { ...(newEntry.cells || {}), ...pendingEdits } };
             } else {
@@ -3556,14 +3593,18 @@ return () => document.removeEventListener('mousedown', handleOutsideClick);
         return next;
       });
 
-      // Surgically patch React Query cache & api client cache
+      // Surgically patch React Query cache & api client cache (including promoted temp edits)
+      const promotedEdits = promotedTempEditsRef.current.get(String(newEntry.id));
+      const entryForCache = promotedEdits
+        ? { ...newEntry, cells: { ...(newEntry.cells || {}), ...promotedEdits } }
+        : newEntry;
       patchAllRegisterCaches((oldData: any) => {
         if (!oldData) return oldData;
         const currentEntries = Array.isArray(oldData.entries) ? oldData.entries : [];
         const filtered = currentEntries.filter(
-          (e: any) => String(e.id) !== String(newEntry.id) && (matchedTempId === undefined || Number(e.id) !== matchedTempId)
+          (e: any) => String(e.id) !== String(entryForCache.id) && (matchedTempId === undefined || Number(e.id) !== matchedTempId)
         );
-        const updated = [...filtered, newEntry].sort((a: any, b: any) => (a.rowNumber || (a as any).row_number || 0) - (b.rowNumber || (b as any).row_number || 0));
+        const updated = [...filtered, entryForCache].sort((a: any, b: any) => (a.rowNumber || (a as any).row_number || 0) - (b.rowNumber || (b as any).row_number || 0));
         return {
           ...oldData,
           entries: updated,
@@ -3933,7 +3974,7 @@ return () => document.removeEventListener('mousedown', handleOutsideClick);
     initialRect,
     getItemKey: useCallback((index: number) => {
       const entry = displayEntries[index];
-      return entry ? `${entry.id}-${entry.rowNumber || index}` : index;
+      return entry ? String(entry.id) : index;
     }, [displayEntries]),
   });
 
@@ -5107,6 +5148,8 @@ return () => document.removeEventListener('mousedown', handleOutsideClick);
         dropdownModal={dropdownModal} setDropdownModal={setDropdownModal}
         dropdownOptions={dropdownOptions} dropdownEntryId={dropdownEntryId} dropdownColumnId={dropdownColumnId}
         dropdownRect={dropdownRect}
+        dropdownCurrentValue={dropdownCurrentValRef.current}
+        onDropdownSelect={dropdownOnSelectRef.current || undefined}
         localEntries={localEntries} handleCellChange={handleCellChange}
         columns={columns}
         onAddDropdownOption={onAddDropdownOption}

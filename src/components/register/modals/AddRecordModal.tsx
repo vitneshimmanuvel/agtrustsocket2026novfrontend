@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { Plus, AlertTriangle, CloudUpload, X, Loader2, Link as LinkIcon, Lock as LockIcon, PenTool } from 'lucide-react';
+import { Plus, AlertTriangle, CloudUpload, X, Loader2, Link as LinkIcon, Lock as LockIcon, PenTool, Eraser } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { formatDateToDDMMYYYY, validatePhoneNumber } from '../../../lib/api';
 import { ImageCompressionModule } from '../../../lib/imageCompressionModule';
@@ -625,6 +625,26 @@ export function AddRecordModal({
             <button type="button" className="row-detail-btn-close" onClick={onClose}>
               Cancel
             </button>
+            {Object.values(values).some(v => (v || '').trim() !== '') && (
+              <button
+                type="button"
+                className="row-detail-btn-close"
+                style={{ color: '#dc2626', borderColor: '#fecaca', background: '#fef2f2', display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '13px', fontWeight: 600 }}
+                title="Clear all entered fields"
+                onClick={() => {
+                  const init: Record<string, string> = {};
+                  columns.forEach(col => {
+                    if (col.type !== 'formula') init[col.id.toString()] = '';
+                  });
+                  setValues(init);
+                  setDuplicates(new Set());
+                  toastedRef.current = new Set();
+                  toast.success('All fields cleared.');
+                }}
+              >
+                <Eraser size={14} /> Clear All
+              </button>
+            )}
             <button
               type="submit"
               onClick={() => setSubmitType('save_and_add')}

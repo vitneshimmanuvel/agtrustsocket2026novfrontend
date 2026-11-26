@@ -159,10 +159,23 @@ const CLIENT_SESSION_ID = typeof window !== 'undefined'
 export function getAuthHeaders(extra?: Record<string, string>): Record<string, string> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json', ...(extra || {}) };
   try {
-    const token = typeof sessionStorage !== 'undefined' ? sessionStorage.getItem('recordbook_token') : null;
+    const token =
+      (typeof sessionStorage !== 'undefined' ? sessionStorage.getItem('recordbook_token') : null) ||
+      (typeof localStorage !== 'undefined' ? localStorage.getItem('recordbook_token') : null);
     if (token) headers['Authorization'] = `Bearer ${token}`;
   } catch {}
   return headers;
+}
+
+function getStoredUser(): any {
+  try {
+    const raw =
+      (typeof sessionStorage !== 'undefined' ? sessionStorage.getItem('recordbook_user') : null) ||
+      (typeof localStorage !== 'undefined' ? localStorage.getItem('recordbook_user') : null);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
 }
 
 export function getClientSessionId(): string {
@@ -549,6 +562,19 @@ export function clearRegisterCache(registerId?: number): void {
 }
 // Mutation queue: ensures operations on the same register run serially to prevent race conditions
 const registerMutationQueues = new Map<string | number, Promise<any>>();
+// Dedicated serial queue per target register for cross-register link synchronization
+const linkedSyncQueues = new Map<number, Promise<any>>();
+function runLinkedSyncTask<T>(targetRegisterId: number, op: () => Promise<T>): Promise<T> {
+  const prev = linkedSyncQueues.get(targetRegisterId) || Promise.resolve();
+  const next = prev.catch(() => {}).then(op);
+  linkedSyncQueues.set(targetRegisterId, next);
+  next.finally(() => {
+    if (linkedSyncQueues.get(targetRegisterId) === next) {
+      linkedSyncQueues.delete(targetRegisterId);
+    }
+  });
+  return next;
+}
 // Tracks how many mutations are currently pending/running globally
 let pendingMutationsCount = 0;
 // Tracks active mutations specifically per register to avoid cache conflicts
@@ -817,10 +843,7 @@ export async function createRegister(data: {
 
 export async function deleteRegister(registerId: number): Promise<void> {
   const reg = await getRegDoc(registerId);
-  const savedUser = JSON.parse(
-    sessionStorage.getItem('recordbook_user') ||
-    'null'
-  );
+  const savedUser = getStoredUser();
 
   const res = await fetch(apiUrl(`/api/registers/${registerId}`), {
     method: 'DELETE',
@@ -1629,10 +1652,7 @@ export async function deleteColumn(registerId: number, columnId: number): Promis
     });
 
     // Move to bin
-    const savedUser = JSON.parse(
-      sessionStorage.getItem('recordbook_user') ||
-      'null'
-    );
+    const savedUser = getStoredUser();
     if (!reg.deletedItems) reg.deletedItems = [];
     reg.deletedItems.push({
       id: generateId(),
@@ -2018,15 +2038,42 @@ export async function setColumnDoubleEntryWarning(registerId: number, columnId: 
 }
 
 export async function clearColumnData(registerId: number, columnId: number): Promise<RegisterDetail> {
-  return runQueuedMutation(registerId, async () => {
-    const reg = await getRegDoc(registerId, true);
+  const reg = await runQueuedMutation(registerId, async () => {
+    const doc = await getRegDoc(registerId, true);
     const colIdStr = columnId.toString();
-    reg.entries.forEach((entry) => {
+    doc.entries.forEach((entry) => {
       if (entry.cells) delete entry.cells[colIdStr];
     });
-    await saveRegDocImmediate(reg, true);
-    return reg;
+    await saveRegDocImmediate(doc, true);
+    return doc;
   });
+
+  const col = reg.columns.find((c) => c.id.toString() === columnId.toString());
+  if (col) {
+    const links = getColumnLinks(col).filter((l) => l.role === 'source');
+    if (links.length > 0) {
+      await Promise.all(
+        links.map((link) =>
+          runLinkedSyncTask(link.registerId, async () => {
+            const targetReg = await getRegDoc(link.registerId, true);
+            const targetColIdStr = link.columnId.toString();
+            let touched = false;
+            targetReg.entries.forEach((entry) => {
+              if (entry.cells && targetColIdStr in entry.cells) {
+                delete entry.cells[targetColIdStr];
+                touched = true;
+              }
+            });
+            if (touched) {
+              await saveRegDocImmediate(targetReg, true);
+            }
+          }).catch((e) => console.error('Failed to sync clearColumnData to linked target:', e))
+        )
+      );
+    }
+  }
+
+  return reg;
 }
 
 export async function insertColumn(registerId: number, data: { name: string; type: string; dropdownOptions?: string[]; formula?: string; minVal?: number; maxVal?: number; optionColors?: Record<string, string> }, position: number): Promise<RegisterDetail> {
@@ -2351,16 +2398,25 @@ export async function updateEntryDirect(
       if (!entry.cells) entry.cells = {};
       entry.cells = { ...entry.cells, ...cells };
     }
+  }
 
-    // 3. Fast linked column sync in background
+  // ── Serialized & Guaranteed Linked Column Sync ──
+  const docForLinks = cached || await getRegDoc(registerId).catch(() => null);
+  if (docForLinks) {
+    const entryForRow = docForLinks.entries?.find((e) => String(e.id) === String(entryId));
+    const rowNum = entryForRow?.rowNumber || 1;
+    const syncPromises: Promise<any>[] = [];
     for (const [colIdStr, value] of Object.entries(cells)) {
-      const col = cached.columns?.find(c => c.id.toString() === colIdStr);
+      const col = docForLinks.columns?.find((c) => c.id.toString() === colIdStr);
       if (col) {
-        const links = getColumnLinks(col).filter(l => l.role === 'source');
+        const links = getColumnLinks(col).filter((l) => l.role === 'source');
         for (const link of links) {
-          _syncLinkedColumn(link.registerId, link.columnId, entryId, entry?.rowNumber || 1, value);
+          syncPromises.push(_syncLinkedColumn(link.registerId, link.columnId, entryId, rowNum, value));
         }
       }
+    }
+    if (syncPromises.length > 0) {
+      await Promise.all(syncPromises);
     }
   }
 
@@ -2395,8 +2451,11 @@ function ensureTargetRows(targetReg: RegisterDetail, maxRowNumber: number) {
 }
 
 async function _syncAddRow(targetRegisterId: number, sourceEntryId: number) {
-  return runQueuedMutation(targetRegisterId, async () => {
+  return runLinkedSyncTask(targetRegisterId, async () => {
     const reg = await getRegDoc(targetRegisterId);
+    if (reg.entries.some(e => e.cells && e.cells["__sourceEntryId"] === sourceEntryId.toString())) {
+      return;
+    }
     const newRowNumber = reg.entries.length + 1;
     const newEntry: Entry = {
       id: generateId(),
@@ -2411,12 +2470,15 @@ async function _syncAddRow(targetRegisterId: number, sourceEntryId: number) {
 
     const res = await fetch(apiUrl(`/api/registers/${targetRegisterId}/entries`), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(newEntry)
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ ...newEntry, clientSessionId: CLIENT_SESSION_ID })
     });
     if (!res.ok) throw new Error('Failed to add entry in sync');
+    const createdEntry: Entry = await res.json().catch(() => newEntry);
 
-    reg.entries.push(newEntry);
+    if (!reg.entries.some(e => String(e.id) === String(createdEntry.id))) {
+      reg.entries.push(createdEntry);
+    }
     renumberRows(reg);
     reg.entryCount = reg.entries.length;
     firestoreRegisterCache.set(reg.id, reg);
@@ -2424,30 +2486,30 @@ async function _syncAddRow(targetRegisterId: number, sourceEntryId: number) {
 }
 
 async function _syncInsertRow(targetRegisterId: number, atIndex: number, sourceEntryId: number) {
-  return runQueuedMutation(targetRegisterId, async () => {
+  return runLinkedSyncTask(targetRegisterId, async () => {
     const reg = await getRegDoc(targetRegisterId);
+    if (reg.entries.some(e => e.cells && e.cells["__sourceEntryId"] === sourceEntryId.toString())) {
+      return;
+    }
 
-    ensureTargetRows(reg, atIndex);
-
-    const newEntry: Entry = {
-      id: generateId(),
-      registerId: targetRegisterId,
-      rowNumber: atIndex + 1,
-      cells: {
-        "__sourceEntryId": sourceEntryId.toString()
-      },
-      createdAt: new Date().toISOString(),
-      pageIndex: 0
-    };
-
-    const res = await fetch(apiUrl(`/api/registers/${targetRegisterId}/entries`), {
+    const res = await fetch(apiUrl(`/api/registers/${targetRegisterId}/entries/insert`), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(newEntry)
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        id: generateId(),
+        atIndex,
+        cells: {
+          "__sourceEntryId": sourceEntryId.toString()
+        },
+        pageIndex: 0,
+        clientSessionId: CLIENT_SESSION_ID
+      })
     });
     if (!res.ok) throw new Error('Failed to insert entry in sync');
+    const createdEntry: Entry = await res.json();
 
-    reg.entries.splice(atIndex, 0, newEntry);
+    const insertPos = Math.max(0, Math.min(atIndex, reg.entries.length));
+    reg.entries.splice(insertPos, 0, createdEntry);
     renumberRows(reg);
     reg.entryCount = reg.entries.length;
     firestoreRegisterCache.set(reg.id, reg);
@@ -2455,8 +2517,8 @@ async function _syncInsertRow(targetRegisterId: number, atIndex: number, sourceE
 }
 
 async function _syncDeleteRow(targetRegisterId: number, sourceEntryId: number, rowNumber: number) {
-  return runQueuedMutation(targetRegisterId, async () => {
-    const reg = await getRegDoc(targetRegisterId);
+  return runLinkedSyncTask(targetRegisterId, async () => {
+    const reg = await getRegDoc(targetRegisterId, true);
     let entryIndex = reg.entries.findIndex((e) => e.cells && e.cells["__sourceEntryId"] === sourceEntryId.toString());
     if (entryIndex === -1) {
       entryIndex = reg.entries.findIndex((e) => Number(e.rowNumber) === Number(rowNumber));
@@ -2464,8 +2526,9 @@ async function _syncDeleteRow(targetRegisterId: number, sourceEntryId: number, r
     if (entryIndex === -1) return;
     const entry = reg.entries[entryIndex];
 
-    const res = await fetch(apiUrl(`/api/registers/${targetRegisterId}/entries/${entry.id}`), {
-      method: 'DELETE'
+    const res = await fetch(apiUrl(`/api/registers/${targetRegisterId}/entries/${entry.id}?clientSessionId=${encodeURIComponent(CLIENT_SESSION_ID)}`), {
+      method: 'DELETE',
+      headers: getAuthHeaders()
     });
     if (!res.ok) throw new Error('Failed to delete entry in sync');
 
@@ -2477,26 +2540,28 @@ async function _syncDeleteRow(targetRegisterId: number, sourceEntryId: number, r
 }
 
 async function _syncBulkDeleteRows(targetRegisterId: number, sourceEntryIds: number[], rowNumbers: number[]) {
-  return runQueuedMutation(targetRegisterId, async () => {
-    const reg = await getRegDoc(targetRegisterId);
+  return runLinkedSyncTask(targetRegisterId, async () => {
+    const reg = await getRegDoc(targetRegisterId, true);
     const idSet = new Set(sourceEntryIds.map(id => id.toString()));
     const rowSet = new Set(rowNumbers.map(Number));
 
     const entriesToDelete = reg.entries.filter(e => {
       const sId = e.cells?.["__sourceEntryId"];
       if (sId && idSet.has(sId)) return true;
-      return rowSet.has(Number(e.rowNumber));
+      return !sId && rowSet.has(Number(e.rowNumber));
     });
     if (entriesToDelete.length === 0) return;
 
-    for (const entry of entriesToDelete) {
-      await fetch(apiUrl(`/api/registers/${targetRegisterId}/entries/${entry.id}`), {
-        method: 'DELETE'
-      });
-    }
+    const targetIds = entriesToDelete.map(e => e.id);
+    const res = await fetch(apiUrl(`/api/registers/${targetRegisterId}/entries/bulk-delete`), {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ entryIds: targetIds, clientSessionId: CLIENT_SESSION_ID })
+    });
+    if (!res.ok) throw new Error('Failed to bulk delete entries in sync');
 
-    const idsToDelete = new Set(entriesToDelete.map(e => e.id));
-    reg.entries = reg.entries.filter(e => !idsToDelete.has(e.id));
+    const idsToDelete = new Set(targetIds.map(String));
+    reg.entries = reg.entries.filter(e => !idsToDelete.has(String(e.id)));
     renumberRows(reg);
     reg.entryCount = reg.entries.length;
     firestoreRegisterCache.set(reg.id, reg);
@@ -2504,8 +2569,8 @@ async function _syncBulkDeleteRows(targetRegisterId: number, sourceEntryIds: num
 }
 
 async function _syncReorderRows(targetRegisterId: number, sortedSourceEntryIds: number[]) {
-  return runQueuedMutation(targetRegisterId, async () => {
-    const reg = await getRegDoc(targetRegisterId);
+  return runLinkedSyncTask(targetRegisterId, async () => {
+    const reg = await getRegDoc(targetRegisterId, true);
 
     const entryMap = new Map<string, Entry>();
     reg.entries.forEach(e => {
@@ -2537,12 +2602,23 @@ async function _syncReorderRows(targetRegisterId: number, sortedSourceEntryIds: 
   }).catch(e => console.error('Failed to sync reorder rows:', e));
 }
 
-// Internal helper to sync
-async function _syncLinkedColumn(targetRegisterId: number, targetColumnId: number, sourceEntryId: number, rowNumber: number, value: string) {
-  try {
+// Internal helper to sync linked cell values cleanly in order, supporting multi-hop links safely
+async function _syncLinkedColumn(
+  targetRegisterId: number,
+  targetColumnId: number,
+  sourceEntryId: number,
+  rowNumber: number,
+  value: string,
+  visited = new Set<string>()
+) {
+  const visitKey = `${targetRegisterId}:${targetColumnId}`;
+  if (visited.has(visitKey)) return;
+  visited.add(visitKey);
+
+  return runLinkedSyncTask(targetRegisterId, async () => {
     const res = await fetch(apiUrl(`/api/registers/${targetRegisterId}/entries/sync-cell`), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders(),
       body: JSON.stringify({
         columnId: targetColumnId,
         sourceEntryId,
@@ -2553,22 +2629,45 @@ async function _syncLinkedColumn(targetRegisterId: number, targetColumnId: numbe
     });
 
     if (res.ok) {
+      const resultData = await res.json().catch(() => null);
+      const serverSyncedEntry: Entry | undefined = resultData?.entry;
+
       // Patch memory cache if target register happens to be loaded in client
       const cached = firestoreRegisterCache.get(targetRegisterId);
       if (cached) {
-        let targetEntry = cached.entries.find(e => e.cells && e.cells["__sourceEntryId"] === sourceEntryId.toString());
-        if (!targetEntry) {
-          targetEntry = cached.entries.find(e => Number(e.rowNumber) === Number(rowNumber));
+        if (serverSyncedEntry) {
+          const idx = cached.entries.findIndex(e => String(e.id) === String(serverSyncedEntry.id));
+          if (idx !== -1) {
+            cached.entries[idx] = serverSyncedEntry;
+          } else {
+            cached.entries.push(serverSyncedEntry);
+            cached.entries.sort((a, b) => Number(a.rowNumber) - Number(b.rowNumber));
+            cached.entryCount = cached.entries.length;
+          }
+        } else {
+          let targetEntry = cached.entries.find(e => e.cells && e.cells["__sourceEntryId"] === sourceEntryId.toString());
+          if (!targetEntry) {
+            targetEntry = cached.entries.find(e => Number(e.rowNumber) === Number(rowNumber));
+          }
+          if (targetEntry) {
+            if (!targetEntry.cells) targetEntry.cells = {};
+            targetEntry.cells[targetColumnId.toString()] = value;
+          }
         }
-        if (targetEntry) {
-          if (!targetEntry.cells) targetEntry.cells = {};
-          targetEntry.cells[targetColumnId.toString()] = value;
+
+        // Propagate downstream if this target column also links out as source
+        const downstreamCol = cached.columns?.find(c => c.id === targetColumnId);
+        if (downstreamCol && serverSyncedEntry) {
+          const downstreamLinks = getColumnLinks(downstreamCol).filter(l => l.role === 'source');
+          for (const dl of downstreamLinks) {
+            _syncLinkedColumn(dl.registerId, dl.columnId, serverSyncedEntry.id, serverSyncedEntry.rowNumber, value, visited);
+          }
         }
       }
     }
-  } catch (e) {
+  }).catch(e => {
     console.error('Failed to sync linked column:', e);
-  }
+  });
 }
 
 export async function linkColumn(
@@ -2582,6 +2681,7 @@ export async function linkColumn(
   let sourceColName = '';
   let sourceColType = '';
   let sourceColDropdownOptions: string[] | undefined;
+  let sourceColOptionColors: Record<string, string> | undefined;
   let sourceMaxRowNumber = 0;
 
   await runQueuedMutation(registerId, async () => {
@@ -2600,6 +2700,7 @@ export async function linkColumn(
       sourceColName = col.name;
       sourceColType = col.type;
       sourceColDropdownOptions = col.dropdownOptions;
+      sourceColOptionColors = col.optionColors;
       sourceMaxRowNumber = reg.entries.length;
       // Gather ALL entries (including those without values) so __sourceEntryId is always set
       const colIdStr = columnId.toString();
@@ -2612,7 +2713,7 @@ export async function linkColumn(
   });
 
   // 2. Update target register: set the metadata, sync name/type, and copy the entries
-  await runQueuedMutation(targetRegisterId, async () => {
+  await runLinkedSyncTask(targetRegisterId, async () => {
     const reg = await getRegDoc(targetRegisterId, true);
     const col = reg.columns.find(c => c.id === targetColumnId);
     if (col) {
@@ -2622,6 +2723,7 @@ export async function linkColumn(
       if (sourceColName) col.name = sourceColName;
       if (sourceColType) col.type = sourceColType;
       if (sourceColDropdownOptions) col.dropdownOptions = sourceColDropdownOptions;
+      if (sourceColOptionColors) col.optionColors = sourceColOptionColors;
 
       // Ensure target register has contiguous rows up to sourceMaxRowNumber
       ensureTargetRows(reg, sourceMaxRowNumber);
@@ -2766,7 +2868,7 @@ export async function unlinkColumn(
 export async function resyncLinkedColumns(registerId: number): Promise<{ synced: number }> {
   let totalSynced = 0;
 
-  const reg = await getRegDoc(registerId);
+  const reg = await getRegDoc(registerId, true);
   const sourceColumnLinks: { sourceCol: Column; link: LinkedTarget }[] = [];
   for (const col of reg.columns) {
     const links = getColumnLinks(col);
@@ -2820,8 +2922,8 @@ export async function resyncLinkedColumns(registerId: number): Promise<{ synced:
     });
 
     // Apply to target register
-    await runQueuedMutation(targetRegId, async () => {
-      const targetReg = await getRegDoc(targetRegId);
+    await runLinkedSyncTask(targetRegId, async () => {
+      const targetReg = await getRegDoc(targetRegId, true);
 
       // Ensure target has enough rows
       ensureTargetRows(targetReg, reg.entries.length);
@@ -2910,7 +3012,7 @@ export async function deleteEntry(registerId: number, entryId: number): Promise<
     if (!res.ok) throw new Error('Failed to delete entry');
 
     if (entry) {
-      const savedUser = JSON.parse(sessionStorage.getItem('recordbook_user') || 'null');
+      const savedUser = getStoredUser();
       if (!reg.deletedItems) reg.deletedItems = [];
       reg.deletedItems.push({
         id: generateId(),
@@ -3115,7 +3217,7 @@ export async function bulkDeleteEntries(registerId: number, entryIds: number[]):
     const reg = await getRegDoc(registerId, true);
     if (!reg.deletedItems) reg.deletedItems = [];
 
-    const savedUser = JSON.parse(sessionStorage.getItem('recordbook_user') || 'null');
+    const savedUser = getStoredUser();
     const idsSet = new Set(entryIds.map(String));
     const newlyDeletedItems: DeletedItem[] = [];
     reg.entries.forEach((e, idx) => {
@@ -3286,10 +3388,7 @@ export async function logAction(
   meta?: { registerId?: number; registerName?: string; entryId?: number }
 ): Promise<void> {
   try {
-    const savedUser = JSON.parse(
-      sessionStorage.getItem('recordbook_user') ||
-      'null'
-    );
+    const savedUser = getStoredUser();
     const res = await fetch(apiUrl('/api/activity'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
