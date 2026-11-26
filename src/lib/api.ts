@@ -64,13 +64,14 @@ export function emitLiveTyping(
   });
 }
 
-/** Emit cell focus event (requests a lock on this cell) */
+/** Emit cell focus event (shows live editor badge; lock prevents concurrent edit when mode='edit') */
 export function emitCellFocus(
   registerId: number | string,
   entryId: number | string,
   colId: string,
   userName: string,
-  userId: number | string
+  userId: number | string,
+  mode: 'focus' | 'edit' = 'edit'
 ) {
   const socket = getSocket();
   socket.emit('cell:focus', {
@@ -79,6 +80,7 @@ export function emitCellFocus(
     colId,
     userName,
     userId,
+    mode,
     clientSessionId: CLIENT_SESSION_ID,
   });
 }
@@ -139,6 +141,7 @@ export interface CellLockInfo {
   userName: string;
   userId: number | string;
   color: string;
+  mode?: 'focus' | 'edit';
 }
 
 // Firestore-backed API client for RecordBook Web

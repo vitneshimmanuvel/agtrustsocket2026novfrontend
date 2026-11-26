@@ -8,7 +8,7 @@ import {
   firebaseGetPendingDownloadRequests,
   firebaseRespondRequest
 } from '../../lib/firebaseAuth';
-import { listBusinesses, listRegisters, deleteRegister, listDeletedRegisters, getAllDeletedItems, getRegister, updateEntryDirect, type RegisterSummary, type Column, type Entry, listSavedShortcuts, createSavedShortcut, deleteSavedShortcut, type SavedRegisterShortcut, renameSavedShortcut, evaluateFormula, getDashboardConfig, saveDashboardConfig } from '../../lib/api';
+import { listBusinesses, listRegisters, deleteRegister, listDeletedRegisters, getAllDeletedItems, getRegister, updateEntryDirect, getSocket, emitJoinRegister, emitLeaveRegister, emitCellFocus, emitCellBlur, type CellLockInfo, type RegisterSummary, type Column, type Entry, listSavedShortcuts, createSavedShortcut, deleteSavedShortcut, type SavedRegisterShortcut, renameSavedShortcut, evaluateFormula, getDashboardConfig, saveDashboardConfig } from '../../lib/api';
 import { cleanActivityLogs } from '../../lib/activityHelper';
 import {
   LayoutDashboard, Users, Activity, ShieldAlert, FileSpreadsheet,
@@ -696,7 +696,7 @@ export default function AdminOverviewPage({ onNavigateTab }: { onNavigateTab: (t
     setDetailReg(reg);
     setDetailLoading(true);
     try {
-      const full = await getRegister(reg.id);
+      const full = await getRegister(reg.id, true);
       setDetailColumns((full.columns || []).sort((a, b) => (a.position ?? 0) - (b.position ?? 0)));
       setDetailEntries(full.entries || []);
     } catch (err: any) {
@@ -832,6 +832,8 @@ export default function AdminOverviewPage({ onNavigateTab }: { onNavigateTab: (t
         onUpdateEntry={(entryId, cells) => {
           setDetailEntries(prev => prev.map(e => String(e.id) === String(entryId) ? { ...e, cells: { ...(e.cells || {}), ...cells } } : e));
         }}
+        onSetEntries={setDetailEntries}
+        onSetColumns={setDetailColumns}
         onOpenFullSheet={(regId) => navigate(`/register/${regId}`)}
         onClose={() => { setDetailReg(null); setDetailColumns([]); setDetailEntries([]); setInitialSearch(''); setInitialFilters([]); }}
       />
@@ -3026,6 +3028,8 @@ function RegisterDetailPanel({
   initialFilters = [],
   onSaveShortcut,
   onUpdateEntry,
+  onSetEntries,
+  onSetColumns,
   onOpenFullSheet
 }: {
   detailReg: { id: number; name: string };
@@ -3037,8 +3041,11 @@ function RegisterDetailPanel({
   initialFilters?: Array<{ columnId: number; operator: string; value: string; value2?: string; values?: string[] }>;
   onSaveShortcut: (name: string, searchQuery: string, filters: any[]) => void;
   onUpdateEntry?: (entryId: number, cells: Record<string, string>) => void;
+  onSetEntries?: React.Dispatch<React.SetStateAction<Entry[]>>;
+  onSetColumns?: React.Dispatch<React.SetStateAction<Column[]>>;
   onOpenFullSheet?: (registerId: number) => void;
 }) {
+  const { user } = useAuth();
   const [showFilterPanel, setShowFilterPanel] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [isFullScreen, setIsFullScreen] = useState(false);
@@ -3047,11 +3054,140 @@ function RegisterDetailPanel({
   const [editingCell, setEditingCell] = useState<{ entryId: number; colId: number } | null>(null);
   const [editingValue, setEditingValue] = useState('');
   const [savingCellKey, setSavingCellKey] = useState<string | null>(null);
+  const [detailLockedCells, setDetailLockedCells] = useState<Map<string, CellLockInfo>>(new Map());
+
+  useEffect(() => {
+    const regIdStr = String(detailReg.id);
+    const socket = getSocket();
+    const uName = (user as any)?.name || user?.email || 'Admin';
+    const uId = user?.id || 'admin';
+    emitJoinRegister(regIdStr, uName, uId, (user as any)?.avatar || '');
+
+    const onConnect = () => emitJoinRegister(regIdStr, uName, uId, (user as any)?.avatar || '');
+    const refreshFromServer = () => {
+      getRegister(detailReg.id, true)
+        .then(full => {
+          onSetColumns?.((full.columns || []).sort((a, b) => (a.position ?? 0) - (b.position ?? 0)));
+          onSetEntries?.(full.entries || []);
+        })
+        .catch(() => {});
+    };
+
+    const onCellUpdate = (diff: any) => {
+      if (String(diff?.registerId) !== regIdStr || !onSetEntries) return;
+      const updates: Record<string, string> = {};
+      if (diff.cells && typeof diff.cells === 'object') Object.assign(updates, diff.cells);
+      if (diff.colKey && diff.value !== undefined) updates[diff.colKey] = diff.value;
+      if (Object.keys(updates).length === 0 && !diff.cellStyles) return;
+      let found = false;
+      onSetEntries(prev => {
+        const next = prev.map(e => {
+          if (String(e.id) !== String(diff.entryId)) return e;
+          found = true;
+          return {
+            ...e,
+            ...(Object.keys(updates).length > 0 ? { cells: { ...(e.cells || {}), ...updates } } : {}),
+            ...(diff.cellStyles ? { cellStyles: { ...(e.cellStyles || {}), ...diff.cellStyles } } : {}),
+          };
+        });
+        return found ? next : prev;
+      });
+      if (!found) refreshFromServer();
+    };
+
+    const onLiveTyping = (data: any) => {
+      if (String(data?.registerId) !== regIdStr || data.entryId === undefined || data.colId === undefined || data.value === undefined) return;
+      onSetEntries?.(prev => prev.map(e => String(e.id) === String(data.entryId)
+        ? { ...e, cells: { ...(e.cells || {}), [String(data.colId)]: data.value } }
+        : e
+      ));
+    };
+
+    const onRowAdd = (diff: any) => {
+      if (String(diff?.registerId) !== regIdStr || !diff.entry || !onSetEntries) return;
+      onSetEntries(prev => {
+        const filtered = prev.filter(e => String(e.id) !== String(diff.entry.id));
+        return [...filtered, diff.entry].sort((a, b) => (a.rowNumber || 0) - (b.rowNumber || 0));
+      });
+    };
+
+    const onRowDelete = (data: any) => {
+      if (String(data?.registerId) !== regIdStr || !onSetEntries) return;
+      onSetEntries(prev => prev.filter(e => String(e.id) !== String(data.entryId)).map((e, i) => ({ ...e, rowNumber: i + 1 })));
+    };
+
+    const onBulkDelete = (data: any) => {
+      if (String(data?.registerId) !== regIdStr || !Array.isArray(data.entryIds) || !onSetEntries) return;
+      const ids = new Set(data.entryIds.map(String));
+      onSetEntries(prev => prev.filter(e => !ids.has(String(e.id))).map((e, i) => ({ ...e, rowNumber: i + 1 })));
+    };
+
+    const onRowReorder = (data: any) => {
+      if (String(data?.registerId) !== regIdStr || !Array.isArray(data.sortedEntryIds) || !onSetEntries) return;
+      const order = new Map<string, number>(data.sortedEntryIds.map((id: any, i: number) => [String(id), i]));
+      onSetEntries(prev => [...prev].sort((a, b) => (order.get(String(a.id)) ?? 999999) - (order.get(String(b.id)) ?? 999999)).map((e, i) => ({ ...e, rowNumber: i + 1 })));
+    };
+
+    const onColumnOrRegUpdate = (data: any) => {
+      if (String(data?.registerId) !== regIdStr) return;
+      if (Array.isArray(data.columns)) onSetColumns?.([...data.columns].sort((a, b) => (a.position ?? 0) - (b.position ?? 0)));
+      if (Array.isArray(data.entries)) onSetEntries?.(data.entries);
+      if (data.syncRequired || (!data.columns && !data.entries)) refreshFromServer();
+    };
+
+    const onLocksSnapshot = (data: any) => {
+      if (String(data?.registerId) !== regIdStr || !Array.isArray(data.locks)) return;
+      const next = new Map<string, CellLockInfo>();
+      for (const lock of data.locks) {
+        if (lock.lockerSocketId && socket.id && lock.lockerSocketId === socket.id) continue;
+        if (!lock.lockerSocketId && String(lock.userId) === String(uId)) continue;
+        next.set(`${lock.entryId}-${lock.colId}`, {
+          entryId: lock.entryId,
+          colId: lock.colId,
+          userName: lock.userName,
+          userId: lock.userId,
+          color: lock.color,
+          mode: lock.mode,
+        });
+      }
+      setDetailLockedCells(next);
+    };
+
+    socket.on('connect', onConnect);
+    socket.on('realtime:resync', refreshFromServer);
+    socket.on('cell:update', onCellUpdate);
+    socket.on('cell:live-typing', onLiveTyping);
+    socket.on('row:add', onRowAdd);
+    socket.on('row:insert', refreshFromServer);
+    socket.on('row:delete', onRowDelete);
+    socket.on('row:bulk-delete', onBulkDelete);
+    socket.on('row:reorder', onRowReorder);
+    socket.on('column:update', onColumnOrRegUpdate);
+    socket.on('register:update', onColumnOrRegUpdate);
+    socket.on('cell:locks-snapshot', onLocksSnapshot);
+
+    return () => {
+      socket.off('connect', onConnect);
+      socket.off('realtime:resync', refreshFromServer);
+      socket.off('cell:update', onCellUpdate);
+      socket.off('cell:live-typing', onLiveTyping);
+      socket.off('row:add', onRowAdd);
+      socket.off('row:insert', refreshFromServer);
+      socket.off('row:delete', onRowDelete);
+      socket.off('row:bulk-delete', onBulkDelete);
+      socket.off('row:reorder', onRowReorder);
+      socket.off('column:update', onColumnOrRegUpdate);
+      socket.off('register:update', onColumnOrRegUpdate);
+      socket.off('cell:locks-snapshot', onLocksSnapshot);
+      emitLeaveRegister(regIdStr);
+    };
+  }, [detailReg.id, user?.id]);
 
   const commitDetailCellEdit = async (entry: Entry, col: Column, nextVal: string) => {
     const colKey = col.id.toString();
     const prevVal = entry.cells?.[colKey] || '';
     setEditingCell(null);
+    emitCellBlur(detailReg.id, entry.id, colKey);
     if (nextVal === prevVal) return;
 
     const key = `${entry.id}-${colKey}`;
@@ -3917,32 +4053,59 @@ function RegisterDetailPanel({
                       const isCellEditable = col.type !== 'formula' && col.type !== 'auto_increment' && col.type !== 'image' && col.type !== 'signature' && !isTargetLinked && Number.isInteger(entry.id);
                       const isEditingThis = editingCell?.entryId === entry.id && editingCell?.colId === col.id;
                       const isSavingThis = savingCellKey === `${entry.id}-${colKey}`;
+                      const cellLock = detailLockedCells.get(`${entry.id}-${colKey}`) || null;
+                      const editorInitial = cellLock ? ((cellLock.userName || 'U').trim().charAt(0).toUpperCase() || 'U') : '';
                       return (
                         <td
                           key={col.id}
                           onDoubleClick={() => {
+                            if (cellLock && cellLock.mode !== 'focus') {
+                              toast(`🔒 ${cellLock.userName} is currently editing this cell`, { id: `admin-lock-${entry.id}-${colKey}`, duration: 1800 });
+                              return;
+                            }
                             if (isCellEditable) {
                               setEditingCell({ entryId: entry.id, colId: col.id });
                               setEditingValue(val);
+                              emitCellFocus(detailReg.id, entry.id, colKey, (user as any)?.name || user?.email || 'Admin', user?.id || 'admin', 'edit');
                             }
                           }}
                           style={{
+                            position: 'relative',
                             padding: isEditingThis ? '3px 6px' : '8px 14px', color: 'var(--foreground)', maxWidth: '280px',
                             overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                             borderRight: '1px solid var(--border-light)', fontSize: '12.5px',
                             cursor: isCellEditable ? 'cell' : 'default',
-                            background: isSavingThis ? 'rgba(16, 185, 129, 0.06)' : undefined
+                            background: isSavingThis ? 'rgba(16, 185, 129, 0.06)' : undefined,
+                            ...(cellLock ? {
+                              outline: `${cellLock.mode !== 'focus' ? '1.5px' : '1px'} solid ${cellLock.color}`,
+                              outlineOffset: cellLock.mode !== 'focus' ? '-1.5px' : '-1px'
+                            } : {})
                           }}
-                          title={isCellEditable ? `${val ? val + ' — ' : ''}Double-click to edit` : val}
+                          title={cellLock ? `${cellLock.userName} is currently ${cellLock.mode === 'focus' ? 'on this cell' : 'editing'}` : (isCellEditable ? `${val ? val + ' — ' : ''}Double-click to edit` : val)}
                         >
+                          {cellLock && (
+                            <span
+                              data-editor-badge="true"
+                              style={{
+                                position: 'absolute', top: '2px', right: '2px',
+                                width: '15px', height: '15px', borderRadius: '50%',
+                                background: cellLock.color, color: '#fff', fontSize: '9px', fontWeight: 800,
+                                display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                                border: '1px solid #fff', lineHeight: 1,
+                                pointerEvents: 'none', zIndex: 2
+                              }}
+                            >
+                              {editorInitial}
+                            </span>
+                          )}
                           {isEditingThis ? (
                             isDropdown && Array.isArray(col.dropdownOptions) && col.dropdownOptions.length > 0 ? (
                               <select
                                 autoFocus
                                 value={editingValue}
                                 onChange={(e) => commitDetailCellEdit(entry, col, e.target.value)}
-                                onBlur={() => setEditingCell(null)}
-                                onKeyDown={(e) => { if (e.key === 'Escape') setEditingCell(null); }}
+                                onBlur={() => { setEditingCell(null); emitCellBlur(detailReg.id, entry.id, colKey); }}
+                                onKeyDown={(e) => { if (e.key === 'Escape') { setEditingCell(null); emitCellBlur(detailReg.id, entry.id, colKey); } }}
                                 style={{
                                   width: '100%', padding: '5px 8px', borderRadius: '6px',
                                   border: '1.5px solid var(--accent)', fontSize: '12.5px',
@@ -3968,6 +4131,7 @@ function RegisterDetailPanel({
                                   } else if (e.key === 'Escape') {
                                     e.preventDefault();
                                     setEditingCell(null);
+                                    emitCellBlur(detailReg.id, entry.id, colKey);
                                   }
                                 }}
                                 style={{

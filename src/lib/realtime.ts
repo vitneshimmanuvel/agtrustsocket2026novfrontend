@@ -76,13 +76,14 @@ interface JoinedRoomState {
   avatar: string;
   color: string;
   joinedAt: number;
-  lockedCell: { entryId: any; colId: string } | null;
+  lockedCell: { entryId: any; colId: string; mode?: 'focus' | 'edit' } | null;
   channel: RealtimeChannel;
   latestMembers: PresenceMessage[];
   presenceHandler: () => void;
   messageHandlers: Array<{ name: string; fn: (msg: { data?: any }) => void }>;
   syncing: boolean;
   syncQueued: boolean;
+  presenceQueue: Promise<void>;
 }
 
 const listeners = new Map<string, Set<(...args: any[]) => void>>();
@@ -93,6 +94,7 @@ let ablyClient: PubSubClient | null = null;
 let fallbackSocket: Socket | null = null;
 let useSocketFallback = false;
 let ablyConnected = false;
+let hadConnectionLoss = false;
 
 let attachedAdminChannel: RealtimeChannel | null = null;
 let adminHandlers: Array<{ name: string; fn: (msg: { data?: any }) => void }> = [];
@@ -210,16 +212,23 @@ function ensureAblyClient(): PubSubClient | null {
   });
 
   ablyClient.connection.on('connected', () => {
+    const isReconnect = hadConnectionLoss;
     ablyConnected = true;
+    hadConnectionLoss = false;
     dispatchLocal('connect');
+    if (isReconnect) {
+      dispatchLocal('realtime:resync');
+    }
   });
 
   ablyClient.connection.on('disconnected', () => {
     ablyConnected = false;
+    hadConnectionLoss = true;
   });
 
   ablyClient.connection.on('suspended', () => {
     ablyConnected = false;
+    hadConnectionLoss = true;
   });
 
   ablyClient.connection.on('closed', () => {
@@ -332,6 +341,7 @@ async function syncRoomPresence(room: JoinedRoomState): Promise<void> {
         userId: any;
         color: string;
         lockerSocketId?: string;
+        mode?: 'focus' | 'edit';
       }> = [];
 
       for (const m of members) {
@@ -358,6 +368,7 @@ async function syncRoomPresence(room: JoinedRoomState): Promise<void> {
             userId: d.id || m.clientId || m.connectionId,
             color: uColor,
             lockerSocketId: m.connectionId,
+            mode: d.lockedCell.mode === 'focus' ? 'focus' : 'edit',
           });
         }
       }
@@ -395,20 +406,34 @@ async function joinRegisterRoom(data: {
   const avatar = data.avatar || '';
   const color = getUserColor(userId);
 
+  const enqueueRoomPresence = (targetRoom: JoinedRoomState, op: () => Promise<void>) => {
+    targetRoom.presenceQueue = targetRoom.presenceQueue
+      .catch(() => {})
+      .then(async () => {
+        if (targetRoom.cancelled || joinedRooms.get(targetRoom.registerId) !== targetRoom) return;
+        await op();
+      })
+      .catch(() => {});
+    return targetRoom.presenceQueue;
+  };
+
   const existing = joinedRooms.get(regId);
   if (existing) {
     existing.userName = userName;
     existing.userId = userId;
     existing.avatar = avatar;
     existing.color = color;
-    existing.channel.presence.enter({
-      id: userId,
-      name: userName,
-      avatar,
-      color,
-      joinedAt: existing.joinedAt,
-      lockedCell: existing.lockedCell,
-    }).then(() => syncRoomPresence(existing)).catch(() => {});
+    await enqueueRoomPresence(existing, async () => {
+      await existing.channel.presence.enter({
+        id: existing.userId,
+        name: existing.userName,
+        avatar: existing.avatar,
+        color: existing.color,
+        joinedAt: existing.joinedAt,
+        lockedCell: existing.lockedCell,
+      });
+      await syncRoomPresence(existing);
+    });
     return;
   }
 
@@ -434,6 +459,7 @@ async function joinRegisterRoom(data: {
     messageHandlers: [],
     syncing: false,
     syncQueued: false,
+    presenceQueue: Promise.resolve(),
   };
   joinedRooms.set(regId, room);
 
@@ -448,25 +474,27 @@ async function joinRegisterRoom(data: {
   channel.presence.subscribe(['enter', 'update', 'leave', 'present'], room.presenceHandler).catch(() => {});
 
   try {
-    await channel.presence.enter({
-      id: userId,
-      name: userName,
-      avatar,
-      color,
-      joinedAt: room.joinedAt,
-      lockedCell: null,
-    });
-    if (room.cancelled || joinedRooms.get(regId) !== room) {
-      if (!joinedRooms.has(regId) && channel.state === 'attached') {
-        channel.presence.leave().catch(() => {}).finally(() => {
-          if (!joinedRooms.has(regId) && channel.state === 'attached') {
-            channel.detach().catch(() => {});
-          }
-        });
+    await enqueueRoomPresence(room, async () => {
+      await channel.presence.enter({
+        id: room.userId,
+        name: room.userName,
+        avatar: room.avatar,
+        color: room.color,
+        joinedAt: room.joinedAt,
+        lockedCell: room.lockedCell,
+      });
+      if (room.cancelled || joinedRooms.get(regId) !== room) {
+        if (!joinedRooms.has(regId) && channel.state === 'attached') {
+          channel.presence.leave().catch(() => {}).finally(() => {
+            if (!joinedRooms.has(regId) && channel.state === 'attached') {
+              channel.detach().catch(() => {});
+            }
+          });
+        }
+        return;
       }
-      return;
-    }
-    await syncRoomPresence(room);
+      await syncRoomPresence(room);
+    });
   } catch (err: any) {
     console.warn(`[Ably Join Room Warning] register:${regId}:`, err?.message || err);
   }
@@ -514,40 +542,62 @@ function focusCell(data: {
   colId: string | number;
   userName?: string;
   userId?: string | number;
+  mode?: 'focus' | 'edit';
 }): void {
   if (!data?.registerId || data.entryId === undefined || data.colId === undefined) return;
   const regId = String(data.registerId);
   const colId = String(data.colId);
+  const mode: 'focus' | 'edit' = data.mode === 'focus' ? 'focus' : 'edit';
   const room = joinedRooms.get(regId);
   if (!room) return;
 
-  const myConnId = ablyClient?.connection?.id;
-  for (const m of room.latestMembers) {
-    const lock = m.data?.lockedCell;
-    if (!lock) continue;
-    const isSameCell = String(lock.entryId) === String(data.entryId) && String(lock.colId) === colId;
-    const isDifferentConn = myConnId ? m.connectionId !== myConnId : String(m.data?.id) !== String(room.userId);
-    if (isSameCell && isDifferentConn) {
-      dispatchLocal('cell:lock-rejected', {
-        registerId: regId,
-        entryId: data.entryId,
-        colId,
-        lockedBy: m.data?.name || 'Collaborator',
-        color: m.data?.color || getUserColor(m.data?.id || m.connectionId),
-      });
-      return;
+  if (mode === 'edit') {
+    const myConnId = ablyClient?.connection?.id;
+    for (const m of room.latestMembers) {
+      const lock = m.data?.lockedCell;
+      if (!lock || lock.mode === 'focus') continue;
+      const isSameCell = String(lock.entryId) === String(data.entryId) && String(lock.colId) === colId;
+      const isDifferentConn = myConnId ? m.connectionId !== myConnId : String(m.data?.id) !== String(room.userId);
+      if (isSameCell && isDifferentConn) {
+        dispatchLocal('cell:lock-rejected', {
+          registerId: regId,
+          entryId: data.entryId,
+          colId,
+          lockedBy: m.data?.name || 'Collaborator',
+          color: m.data?.color || getUserColor(m.data?.id || m.connectionId),
+        });
+        return;
+      }
     }
   }
 
-  room.lockedCell = { entryId: data.entryId, colId };
-  room.channel.presence.update({
-    id: room.userId,
-    name: data.userName || room.userName,
-    avatar: room.avatar,
-    color: room.color,
-    joinedAt: room.joinedAt,
-    lockedCell: room.lockedCell,
-  }).catch(() => {});
+  // Skip redundant frame if unchanged
+  if (
+    room.lockedCell &&
+    String(room.lockedCell.entryId) === String(data.entryId) &&
+    String(room.lockedCell.colId) === colId &&
+    (room.lockedCell.mode || 'edit') === mode
+  ) {
+    return;
+  }
+
+  const nextLocked = { entryId: data.entryId, colId, mode };
+  room.lockedCell = nextLocked;
+  const nextName = data.userName || room.userName;
+  room.presenceQueue = room.presenceQueue
+    .catch(() => {})
+    .then(async () => {
+      if (room.cancelled || joinedRooms.get(regId) !== room) return;
+      await room.channel.presence.update({
+        id: room.userId,
+        name: nextName,
+        avatar: room.avatar,
+        color: room.color,
+        joinedAt: room.joinedAt,
+        lockedCell: room.lockedCell,
+      });
+    })
+    .catch(() => {});
 }
 
 function blurCell(data: { registerId: string | number; entryId: any; colId: string | number }): void {
@@ -562,14 +612,20 @@ function blurCell(data: { registerId: string | number; entryId: any; colId: stri
   if (!matches) return;
 
   room.lockedCell = null;
-  room.channel.presence.update({
-    id: room.userId,
-    name: room.userName,
-    avatar: room.avatar,
-    color: room.color,
-    joinedAt: room.joinedAt,
-    lockedCell: null,
-  }).catch(() => {});
+  room.presenceQueue = room.presenceQueue
+    .catch(() => {})
+    .then(async () => {
+      if (room.cancelled || joinedRooms.get(regId) !== room) return;
+      await room.channel.presence.update({
+        id: room.userId,
+        name: room.userName,
+        avatar: room.avatar,
+        color: room.color,
+        joinedAt: room.joinedAt,
+        lockedCell: room.lockedCell,
+      });
+    })
+    .catch(() => {});
 }
 
 function publishToRoomChannel(eventName: string, data: any): void {

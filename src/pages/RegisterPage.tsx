@@ -171,12 +171,10 @@ export default function RegisterPage({ overrideRegisterId, compact, onSplitView,
 
   const { data: register, isLoading, error } = useQuery({
     queryKey: ['register', registerId],
-    queryFn: () => getRegister(Number(registerId)),
+    queryFn: () => getRegister(Number(registerId), true),
     enabled: !!registerId && !isNaN(Number(registerId)),
-    staleTime: 60 * 1000,
-    // Window-focus and interval full refetches disabled — real-time live delta sync
-    // runs every 1.5s to prevent background full snapshots from wiping newly entered cells.
-    refetchOnWindowFocus: false,
+    staleTime: 10 * 1000,
+    refetchOnWindowFocus: true,
     refetchInterval: false,
     placeholderData: keepPreviousData,
   });
@@ -3355,7 +3353,17 @@ return () => document.removeEventListener('mousedown', handleOutsideClick);
     const onConnect = () => {
       emitJoinRegister(regIdStr, currentUserName, currentUserId, currentAvatar);
     };
+    const onRealtimeResync = () => {
+      if (
+        Object.keys(debounceTimers.current).length === 0 &&
+        pendingRowMutationsCount.current === 0 &&
+        getPendingMutationsCount() === 0
+      ) {
+        invalidateAllRegisterCaches();
+      }
+    };
     socket.on('connect', onConnect);
+    socket.on('realtime:resync', onRealtimeResync);
 
     // ── Live Keystroke Handler (Character-by-Character from other users) ──
     const handleLiveTyping = (data: { registerId: string; entryId: any; colId: string; value: string; userName: string; userId: any; color: string; clientSessionId?: string }) => {
@@ -3378,7 +3386,7 @@ return () => document.removeEventListener('mousedown', handleOutsideClick);
     };
 
     // ── Cell Lock Handler ──
-    const handleCellLocked = (data: { registerId: string; entryId: any; colId: string; userName: string; userId: any; color: string; lockerSocketId?: string }) => {
+    const handleCellLocked = (data: { registerId: string; entryId: any; colId: string; userName: string; userId: any; color: string; lockerSocketId?: string; mode?: 'focus' | 'edit' }) => {
       if (String(data.registerId) !== regIdStr) return;
       // Don't lock our own active socket connection (supports multi-tab collaboration even on same account)
       if (data.lockerSocketId && socket.id) {
@@ -3389,13 +3397,13 @@ return () => document.removeEventListener('mousedown', handleOutsideClick);
       const cellKey = `${data.entryId}-${data.colId}`;
       setLockedCells(prev => {
         const next = new Map(prev);
-        next.set(cellKey, { entryId: data.entryId, colId: data.colId, userName: data.userName, userId: data.userId, color: data.color });
+        next.set(cellKey, { entryId: data.entryId, colId: data.colId, userName: data.userName, userId: data.userId, color: data.color, mode: data.mode });
         return next;
       });
     };
 
     // ── Initial Cell Locks Snapshot on Room Join ──
-    const handleCellLocksSnapshot = (data: { registerId: string; locks: Array<{ entryId: any; colId: string; userName: string; userId: any; color: string; lockerSocketId?: string }> }) => {
+    const handleCellLocksSnapshot = (data: { registerId: string; locks: Array<{ entryId: any; colId: string; userName: string; userId: any; color: string; lockerSocketId?: string; mode?: 'focus' | 'edit' }> }) => {
       if (String(data.registerId) !== regIdStr || !Array.isArray(data.locks)) return;
       const next = new Map<string, CellLockInfo>();
       for (const lock of data.locks) {
@@ -3408,6 +3416,7 @@ return () => document.removeEventListener('mousedown', handleOutsideClick);
           userName: lock.userName,
           userId: lock.userId,
           color: lock.color,
+          mode: lock.mode,
         });
       }
       setLockedCells(next);
@@ -3481,12 +3490,14 @@ return () => document.removeEventListener('mousedown', handleOutsideClick);
 
       const targetEntryIdStr = String(diff.entryId);
 
+      let matchedInLocal = false;
       // 1. Patch local state strictly by entry.id, preserving any active debounced local edits
       setLocalEntries(prev => {
         let matched = false;
         const next = prev.map(e => {
           if (String(e.id) !== targetEntryIdStr) return e;
           matched = true;
+          matchedInLocal = true;
           const pendingForRow = pendingCellEditsRef.current.get(Number(e.id));
           let safeCellUpdates = cellUpdates;
           if (pendingForRow && hasCellUpdates) {
@@ -3507,10 +3518,20 @@ return () => document.removeEventListener('mousedown', handleOutsideClick);
             ...(updatedStyles !== undefined ? { cellStyles: updatedStyles } : {}),
           };
         });
-        if (!matched) return prev;
+        if (!matched) {
+          if (
+            Object.keys(debounceTimers.current).length === 0 &&
+            pendingRowMutationsCount.current === 0 &&
+            getPendingMutationsCount() === 0
+          ) {
+            setTimeout(() => invalidateAllRegisterCaches(), 0);
+          }
+          return prev;
+        }
         localEntriesRef.current = next;
         return next;
       });
+      void matchedInLocal;
 
       // 2. Surgically patch React Query cache & api client cache
       patchAllRegisterCaches((oldData: any) => {
@@ -3757,6 +3778,7 @@ return () => document.removeEventListener('mousedown', handleOutsideClick);
 
     return () => {
       socket.off('connect', onConnect);
+      socket.off('realtime:resync', onRealtimeResync);
       socket.off('cell:update', handleCellUpdate);
       socket.off('row:add', handleRowAdd);
       socket.off('row:insert', handleRowInsert);
@@ -4272,6 +4294,48 @@ return () => document.removeEventListener('mousedown', handleOutsideClick);
               <Plus size={16} strokeWidth={2.5} />
             </button>
           )}
+          {(() => {
+            const otherActive = activeUsers.filter((u) => String(u.id) !== String(user?.id));
+            if (otherActive.length === 0) return null;
+            return (
+              <div
+                style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', marginLeft: '4px', flexShrink: 0 }}
+                title={`Live now: ${otherActive.map((u) => u.name).join(', ')}`}
+              >
+                {otherActive.slice(0, 4).map((u) => {
+                  const initial = (u.name || 'U').trim().charAt(0).toUpperCase() || 'U';
+                  return (
+                    <span
+                      key={String(u.id)}
+                      style={{
+                        width: '24px',
+                        height: '24px',
+                        borderRadius: '50%',
+                        background: u.color || '#3b82f6',
+                        color: '#ffffff',
+                        fontSize: '11px',
+                        fontWeight: 800,
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        border: '2px solid #ffffff',
+                        boxShadow: '0 1px 4px rgba(15, 23, 42, 0.2)',
+                        flexShrink: 0,
+                      }}
+                      title={`${u.name} is viewing/editing`}
+                    >
+                      {initial}
+                    </span>
+                  );
+                })}
+                {otherActive.length > 4 && (
+                  <span style={{ fontSize: '11px', fontWeight: 700, color: '#64748b', marginLeft: '2px' }}>
+                    +{otherActive.length - 4}
+                  </span>
+                )}
+              </div>
+            );
+          })()}
         </div>
 
         <div className="register-header-right">

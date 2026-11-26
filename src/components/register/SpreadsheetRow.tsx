@@ -90,7 +90,7 @@ interface SpreadsheetTextInputProps {
   cellLock?: CellLockInfo | null;
 }
 
-const SplitTextInput = React.memo(({ idx, col, entry, visibleColumns, colIdx, totalRows, handleCellChange, type = 'text', placeholder, readOnly, scrollToColumn }: SpreadsheetTextInputProps) => {
+const SplitTextInput = React.memo(({ idx, col, entry, visibleColumns, colIdx, totalRows, handleCellChange, type = 'text', placeholder, readOnly, scrollToColumn, registerId, currentUserName, currentUserId }: SpreadsheetTextInputProps) => {
   const initialValue = entry.cells?.[col.id.toString()] || '';
   const [leftVal, rightVal] = typeof initialValue === 'string' && initialValue.includes(' ||| ') ? initialValue.split(' ||| ') : ['', ''];
   const [leftState, setLeftState] = useState(leftVal || '');
@@ -142,22 +142,32 @@ const SplitTextInput = React.memo(({ idx, col, entry, visibleColumns, colIdx, to
 
   const handleLeftBlur = () => {
     setTimeout(() => {
+      const activeId = document.activeElement?.id;
+      if (isEditingLeftRef.current && activeId === `cell-${idx}-${col.id}`) return;
       const wasEditing = isEditingLeftRef.current;
       isEditingLeftRef.current = false;
       setIsEditingLeft(false);
       if (!readOnly && wasEditing) {
         saveSplitVal(leftStateRef.current, rightStateRef.current);
       }
+      if (registerId !== undefined && activeId !== `cell-${idx}-${col.id}-right`) {
+        emitCellBlur(registerId, entry.id, String(col.id));
+      }
     }, 150);
   };
 
   const handleRightBlur = () => {
     setTimeout(() => {
+      const activeId = document.activeElement?.id;
+      if (isEditingRightRef.current && activeId === `cell-${idx}-${col.id}-right`) return;
       const wasEditing = isEditingRightRef.current;
       isEditingRightRef.current = false;
       setIsEditingRight(false);
       if (!readOnly && wasEditing) {
         saveSplitVal(leftStateRef.current, rightStateRef.current);
+      }
+      if (registerId !== undefined && activeId !== `cell-${idx}-${col.id}`) {
+        emitCellBlur(registerId, entry.id, String(col.id));
       }
     }, 150);
   };
@@ -384,9 +394,21 @@ const SplitTextInput = React.memo(({ idx, col, entry, visibleColumns, colIdx, to
             data-cell={`cell-${idx}-${col.id}`}
             className={`cell-input cell-display-mode ${readOnly ? 'cell-readonly' : ''}`}
             tabIndex={readOnly ? -1 : 0}
+            onFocus={() => {
+              if (!readOnly && registerId !== undefined) {
+                emitCellFocus(registerId, entry.id, String(col.id), currentUserName || 'User', currentUserId || 'anon', 'focus');
+              }
+            }}
             onBlur={handleLeftBlur}
             onKeyDown={handleLeftKeyDown}
-            onDoubleClick={() => !readOnly && setIsEditingLeft(true)}
+            onDoubleClick={() => {
+              if (!readOnly) {
+                setIsEditingLeft(true);
+                if (registerId !== undefined) {
+                  emitCellFocus(registerId, entry.id, String(col.id), currentUserName || 'User', currentUserId || 'anon', 'edit');
+                }
+              }
+            }}
             style={{
               width: '100%',
               height: '100%',
@@ -437,9 +459,21 @@ const SplitTextInput = React.memo(({ idx, col, entry, visibleColumns, colIdx, to
             data-cell={`cell-${idx}-${col.id}-right`}
             className={`cell-input cell-display-mode ${readOnly ? 'cell-readonly' : ''}`}
             tabIndex={readOnly ? -1 : 0}
+            onFocus={() => {
+              if (!readOnly && registerId !== undefined) {
+                emitCellFocus(registerId, entry.id, String(col.id), currentUserName || 'User', currentUserId || 'anon', 'focus');
+              }
+            }}
             onBlur={handleRightBlur}
             onKeyDown={handleRightKeyDown}
-            onDoubleClick={() => !readOnly && setIsEditingRight(true)}
+            onDoubleClick={() => {
+              if (!readOnly) {
+                setIsEditingRight(true);
+                if (registerId !== undefined) {
+                  emitCellFocus(registerId, entry.id, String(col.id), currentUserName || 'User', currentUserId || 'anon', 'edit');
+                }
+              }
+            }}
             style={{
               width: '100%',
               height: '100%',
@@ -462,7 +496,7 @@ const SplitTextInput = React.memo(({ idx, col, entry, visibleColumns, colIdx, to
   );
 });
 
-const SplitCurrencyCell = React.memo(({ idx, col, entry, colIdx, totalRows, visibleColumns, handleCellChange, readOnly, scrollToColumn }: SpreadsheetTextInputProps) => {
+const SplitCurrencyCell = React.memo(({ idx, col, entry, colIdx, totalRows, visibleColumns, handleCellChange, readOnly, scrollToColumn, registerId, currentUserName, currentUserId }: SpreadsheetTextInputProps) => {
   const rawValue = entry.cells?.[col.id.toString()] || '';
   const [leftAmount, rightAmount] = typeof rawValue === 'string' && rawValue.includes(' ||| ') ? rawValue.split(' ||| ') : ['', ''];
   const [leftState, setLeftState] = useState(leftAmount || '');
@@ -514,22 +548,32 @@ const SplitCurrencyCell = React.memo(({ idx, col, entry, colIdx, totalRows, visi
 
   const handleLeftBlur = () => {
     setTimeout(() => {
+      const activeId = document.activeElement?.id;
+      if (isEditingLeftRef.current && activeId === `cell-${idx}-${col.id}`) return;
       const wasEditing = isEditingLeftRef.current;
       isEditingLeftRef.current = false;
       setIsEditingLeft(false);
       if (!readOnly && wasEditing) {
         saveSplitVal(leftStateRef.current, rightStateRef.current);
       }
+      if (registerId !== undefined && activeId !== `cell-${idx}-${col.id}-right`) {
+        emitCellBlur(registerId, entry.id, String(col.id));
+      }
     }, 150);
   };
 
   const handleRightBlur = () => {
     setTimeout(() => {
+      const activeId = document.activeElement?.id;
+      if (isEditingRightRef.current && activeId === `cell-${idx}-${col.id}-right`) return;
       const wasEditing = isEditingRightRef.current;
       isEditingRightRef.current = false;
       setIsEditingRight(false);
       if (!readOnly && wasEditing) {
         saveSplitVal(leftStateRef.current, rightStateRef.current);
+      }
+      if (registerId !== undefined && activeId !== `cell-${idx}-${col.id}`) {
+        emitCellBlur(registerId, entry.id, String(col.id));
       }
     }, 150);
   };
@@ -840,7 +884,7 @@ const CurrencyCell = React.memo(({ idx, col, entry, colIdx, totalRows, visibleCo
   const valRef = useRef(rawValue);
   const isEditingRef = useRef(false);
   const liveTypingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const isLockedByOther = !!cellLock;
+  const isLockedByOther = !!cellLock && cellLock.mode !== 'focus';
   const effectiveReadOnly = readOnly || isLockedByOther;
   const latestCurrPropsRef = useRef({ rawValue, entryId: entry.id, colId: col.id.toString(), handleCellChange, effectiveReadOnly });
   latestCurrPropsRef.current = { rawValue, entryId: entry.id, colId: col.id.toString(), handleCellChange, effectiveReadOnly };
@@ -911,7 +955,7 @@ const CurrencyCell = React.memo(({ idx, col, entry, colIdx, totalRows, visibleCo
     isEditingRef.current = true;
     setEditing(true);
     if (registerId !== undefined) {
-      emitCellFocus(registerId, entry.id, String(col.id), currentUserName || 'User', currentUserId || 'anon');
+      emitCellFocus(registerId, entry.id, String(col.id), currentUserName || 'User', currentUserId || 'anon', 'edit');
     }
     if (initialChar !== undefined) {
       setVal(initialChar);
@@ -1038,6 +1082,19 @@ const CurrencyCell = React.memo(({ idx, col, entry, colIdx, totalRows, visibleCo
       id={`cell-${idx}-${col.id}`}
       tabIndex={readOnly ? -1 : 0}
       className={`cell-currency ${effectiveReadOnly ? 'cell-readonly' : ''}`}
+      onFocus={() => {
+        if (!effectiveReadOnly && registerId !== undefined && !isEditingRef.current) {
+          emitCellFocus(registerId, entry.id, String(col.id), currentUserName || 'User', currentUserId || 'anon', 'focus');
+        }
+      }}
+      onBlur={() => {
+        setTimeout(() => {
+          const stillActive = document.activeElement?.id === `cell-${idx}-${col.id}`;
+          if (!isEditingRef.current && !stillActive && registerId !== undefined) {
+            emitCellBlur(registerId, entry.id, String(col.id));
+          }
+        }, 120);
+      }}
       onDoubleClick={() => startEditing()}
       onKeyDown={(e) => {
         if (e.key === 'Delete' || e.key === 'Backspace') {
@@ -1087,7 +1144,7 @@ const SpreadsheetTextInput = React.memo(({ idx, col, entry, visibleColumns, colI
   const liveTypingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [dropdownPos, setDropdownPos] = useState<{ top: number; left: number; width: number } | null>(null);
 
-  const isLockedByOther = !!cellLock;
+  const isLockedByOther = !!cellLock && cellLock.mode !== 'focus';
   const effectiveReadOnly = readOnly || isLockedByOther;
   const latestTextPropsRef = useRef({ initialValue, entryId: entry.id, colId: col.id.toString(), handleCellChange, effectiveReadOnly });
   latestTextPropsRef.current = { initialValue, entryId: entry.id, colId: col.id.toString(), handleCellChange, effectiveReadOnly };
@@ -1152,7 +1209,7 @@ const SpreadsheetTextInput = React.memo(({ idx, col, entry, visibleColumns, colI
     setIsEditing(true);
     setFocused(true);
     if (registerId !== undefined) {
-      emitCellFocus(registerId, entry.id, String(col.id), currentUserName || 'User', currentUserId || 'anon');
+      emitCellFocus(registerId, entry.id, String(col.id), currentUserName || 'User', currentUserId || 'anon', 'edit');
     }
     if (initialChar !== undefined) {
       valRef.current = initialChar;
@@ -1222,8 +1279,12 @@ const SpreadsheetTextInput = React.memo(({ idx, col, entry, visibleColumns, colI
   }, [entry, col.id, handleCellChange, registerId, flushLiveTyping]);
 
   const onBlur = useCallback(() => {
-    // Delay to allow click on dropdown item
+    // Delay to allow click on dropdown item or switching from display div -> input on dblclick
     setTimeout(() => {
+      const targetId = `cell-${idx}-${col.id}`;
+      if (isEditingRef.current && document.activeElement?.id === targetId) {
+        return;
+      }
       if (liveTypingTimerRef.current) {
         clearTimeout(liveTypingTimerRef.current);
         liveTypingTimerRef.current = null;
@@ -1234,7 +1295,12 @@ const SpreadsheetTextInput = React.memo(({ idx, col, entry, visibleColumns, colI
       setIsEditing(false);
       setIsDeleting(false);
       setHighlightIdx(-1);
-      if (!wasEditing) return;
+      if (!wasEditing) {
+        if (registerId !== undefined && document.activeElement?.id !== targetId) {
+          emitCellBlur(registerId, entry.id, String(col.id));
+        }
+        return;
+      }
       if (effectiveReadOnly) {
         if (registerId !== undefined) emitCellBlur(registerId, entry.id, String(col.id));
         return;
@@ -1255,7 +1321,7 @@ const SpreadsheetTextInput = React.memo(({ idx, col, entry, visibleColumns, colI
         emitCellBlur(registerId, entry.id, String(col.id));
       }
     }, 150);
-  }, [entry, col.id, handleCellChange, effectiveReadOnly, registerId, flushLiveTyping]);
+  }, [idx, entry, col.id, handleCellChange, effectiveReadOnly, registerId, flushLiveTyping]);
 
   const onKeyDown = useCallback((e: React.KeyboardEvent<any>) => {
     if (col.type === 'date') {
@@ -1465,7 +1531,13 @@ const SpreadsheetTextInput = React.memo(({ idx, col, entry, visibleColumns, colI
 
   const hasHighlight = !!searchTerm && !!val && val.toLowerCase().includes(searchTerm.toLowerCase());
 
-  const handleFocus = useCallback(() => !effectiveReadOnly && setFocused(true), [effectiveReadOnly]);
+  const handleFocus = useCallback(() => {
+    if (effectiveReadOnly) return;
+    setFocused(true);
+    if (registerId !== undefined && !isEditingRef.current) {
+      emitCellFocus(registerId, entry.id, String(col.id), currentUserName || 'User', currentUserId || 'anon', 'focus');
+    }
+  }, [effectiveReadOnly, registerId, entry.id, col.id, currentUserName, currentUserId]);
 
 
   if (!isEditing) {
@@ -1867,15 +1939,17 @@ export const SpreadsheetRow = React.memo(function SpreadsheetRow(props: Spreadsh
         );
         const isEditable = isRowEditableByRange && (!editableColumnIds || editableColumnIds.has(col.id));
         const cellLock = lockedCells?.get(`${entry.id}-${col.id}`) || null;
-        const isLockedByOther = !!cellLock;
+        const hasEditorPresence = !!cellLock;
+        const isLockedByOther = !!cellLock && cellLock.mode !== 'focus';
         const canEditCell = isEditable && !isLockedByOther;
         const isCellHidden = !!cs?.hidden;
         const isCellRevealed = isEditable && !!peekHiddenCols[col.id.toString()];
-        if (isLockedByOther && cellLock) {
+        const isActivelyEditingOther = hasEditorPresence && cellLock?.mode !== 'focus';
+        if (hasEditorPresence && cellLock) {
           cellStyle = {
             ...cellStyle,
-            outline: `2px solid ${cellLock.color}`,
-            outlineOffset: '-2px',
+            outline: `${isActivelyEditingOther ? '1.5px' : '1px'} solid ${cellLock.color}`,
+            outlineOffset: isActivelyEditingOther ? '-1.5px' : '-1px',
           };
         }
         
@@ -1885,34 +1959,39 @@ export const SpreadsheetRow = React.memo(function SpreadsheetRow(props: Spreadsh
             onCellFormatClick(entry.id, col.id.toString(), (e.currentTarget as HTMLElement).getBoundingClientRect());
           }
         };
+
+        const editorInitial = hasEditorPresence && cellLock
+          ? ((cellLock.userName || 'U').trim().charAt(0).toUpperCase() || 'U')
+          : '';
         
         return (
         <td key={col.id} className={isFrozen ? 'frozen-col' : ''} style={cellStyle} onContextMenu={handleContextMenu}>
           <div className="cell-inner-wrapper" style={{ position: 'relative', width: '100%', height: '100%', display: 'flex', flex: 1 }}>
-          {isLockedByOther && cellLock && (
+          {hasEditorPresence && cellLock && (
             <div
+              data-editor-badge="true"
               style={{
                 position: 'absolute',
-                top: '1px',
+                top: '2px',
                 right: '2px',
                 zIndex: 15,
                 pointerEvents: 'none',
+                width: '15px',
+                height: '15px',
+                borderRadius: '50%',
                 background: cellLock.color,
                 color: '#ffffff',
                 fontSize: '9px',
-                fontWeight: 700,
-                lineHeight: 1.2,
-                padding: '1px 5px',
-                borderRadius: '4px',
-                maxWidth: '90px',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                whiteSpace: 'nowrap',
-                boxShadow: '0 1px 2px rgba(0,0,0,0.18)',
+                fontWeight: 800,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                border: '1px solid #ffffff',
+                lineHeight: 1,
               }}
-              title={`${cellLock.userName} is currently editing`}
+              title={`${cellLock.userName} is currently ${isActivelyEditingOther ? 'editing' : 'on this cell'}`}
             >
-              {cellLock.userName}
+              {editorInitial}
             </div>
           )}
           {isSavingCell && (
@@ -2036,7 +2115,7 @@ export const SpreadsheetRow = React.memo(function SpreadsheetRow(props: Spreadsh
               {typeof entry.cells?.[col.id.toString()] === 'string' && entry.cells[col.id.toString()].includes(' ||| ') ? (
                 <SplitTextInput
                   idx={idx} col={col} entry={entry} visibleColumns={visibleColumns} colIdx={colIdx} totalRows={totalRows} handleCellChange={handleCellChange}
-                  placeholder="DD-MM-YYYY" readOnly={!canEditCell} scrollToColumn={scrollToColumn}
+                  placeholder="DD-MM-YYYY" readOnly={!canEditCell} scrollToColumn={scrollToColumn} registerId={registerId} currentUserName={currentUserName} currentUserId={currentUserId}
                 />
               ) : (
                 <SpreadsheetTextInput 
@@ -2070,10 +2149,23 @@ export const SpreadsheetRow = React.memo(function SpreadsheetRow(props: Spreadsh
               data-cell={`cell-${idx}-${col.id}`} 
               tabIndex={isEditable ? 0 : -1} 
               className={`cell-dropdown ${!canEditCell ? 'cell-readonly' : ''}`} 
+              onFocus={() => {
+                if (canEditCell && registerId !== undefined) {
+                  emitCellFocus(registerId, entry.id, String(col.id), currentUserName || 'User', currentUserId || 'anon', 'focus');
+                }
+              }}
+              onBlur={() => {
+                if (registerId !== undefined) {
+                  emitCellBlur(registerId, entry.id, String(col.id));
+                }
+              }}
               onClick={isEditable ? (e) => {
                 if (isLockedByOther && cellLock) {
                   toast(`🔒 ${cellLock.userName} is currently editing this cell`, { id: `lock-${entry.id}-${col.id}`, duration: 1800 });
                   return;
+                }
+                if (registerId !== undefined) {
+                  emitCellFocus(registerId, entry.id, String(col.id), currentUserName || 'User', currentUserId || 'anon', 'edit');
                 }
                 let opts = col.dropdownOptions || [];
                 if (col.type === 'yes_no' && opts.length === 0) opts = ['Yes', 'No'];
@@ -2278,7 +2370,7 @@ export const SpreadsheetRow = React.memo(function SpreadsheetRow(props: Spreadsh
           ) : col.type === 'email' ? (
             <div className="cell-url-wrap">
               {typeof entry.cells?.[col.id.toString()] === 'string' && entry.cells[col.id.toString()].includes(' ||| ') ? (
-                <SplitTextInput idx={idx} col={col} entry={entry} visibleColumns={visibleColumns} colIdx={colIdx} totalRows={totalRows} handleCellChange={handleCellChange} type="email" placeholder="name@example.com" readOnly={!canEditCell} scrollToColumn={scrollToColumn} />
+                <SplitTextInput idx={idx} col={col} entry={entry} visibleColumns={visibleColumns} colIdx={colIdx} totalRows={totalRows} handleCellChange={handleCellChange} type="email" placeholder="name@example.com" readOnly={!canEditCell} scrollToColumn={scrollToColumn} registerId={registerId} currentUserName={currentUserName} currentUserId={currentUserId} />
               ) : (
                 <SpreadsheetTextInput idx={idx} col={col} entry={entry} visibleColumns={visibleColumns} colIdx={colIdx} totalRows={totalRows} handleCellChange={handleCellChange} type="email" placeholder="name@example.com" searchTerm={searchTerm} readOnly={!isEditable} scrollToColumn={scrollToColumn} registerId={registerId} currentUserName={currentUserName} currentUserId={currentUserId} cellLock={cellLock} />
               )}
@@ -2287,7 +2379,7 @@ export const SpreadsheetRow = React.memo(function SpreadsheetRow(props: Spreadsh
           ) : col.type === 'phone' ? (
             <div className="cell-url-wrap">
               {typeof entry.cells?.[col.id.toString()] === 'string' && entry.cells[col.id.toString()].includes(' ||| ') ? (
-                <SplitTextInput idx={idx} col={col} entry={entry} visibleColumns={visibleColumns} colIdx={colIdx} totalRows={totalRows} handleCellChange={handleCellChange} type="tel" placeholder="+91 98765 43210" readOnly={!canEditCell} scrollToColumn={scrollToColumn} />
+                <SplitTextInput idx={idx} col={col} entry={entry} visibleColumns={visibleColumns} colIdx={colIdx} totalRows={totalRows} handleCellChange={handleCellChange} type="tel" placeholder="+91 98765 43210" readOnly={!canEditCell} scrollToColumn={scrollToColumn} registerId={registerId} currentUserName={currentUserName} currentUserId={currentUserId} />
               ) : (
                 <SpreadsheetTextInput idx={idx} col={col} entry={entry} visibleColumns={visibleColumns} colIdx={colIdx} totalRows={totalRows} handleCellChange={handleCellChange} type="tel" placeholder="+91 98765 43210" searchTerm={searchTerm} readOnly={!isEditable} scrollToColumn={scrollToColumn} registerId={registerId} currentUserName={currentUserName} currentUserId={currentUserId} cellLock={cellLock} />
               )}
@@ -2296,7 +2388,7 @@ export const SpreadsheetRow = React.memo(function SpreadsheetRow(props: Spreadsh
           ) : col.type === 'url' ? (
             <div className="cell-url-wrap">
               {typeof entry.cells?.[col.id.toString()] === 'string' && entry.cells[col.id.toString()].includes(' ||| ') ? (
-                <SplitTextInput idx={idx} col={col} entry={entry} visibleColumns={visibleColumns} colIdx={colIdx} totalRows={totalRows} handleCellChange={handleCellChange} type="url" placeholder="https://..." readOnly={!canEditCell} scrollToColumn={scrollToColumn} />
+                <SplitTextInput idx={idx} col={col} entry={entry} visibleColumns={visibleColumns} colIdx={colIdx} totalRows={totalRows} handleCellChange={handleCellChange} type="url" placeholder="https://..." readOnly={!canEditCell} scrollToColumn={scrollToColumn} registerId={registerId} currentUserName={currentUserName} currentUserId={currentUserId} />
               ) : (
                 <SpreadsheetTextInput idx={idx} col={col} entry={entry} visibleColumns={visibleColumns} colIdx={colIdx} totalRows={totalRows} handleCellChange={handleCellChange} type="url" placeholder="https://..." searchTerm={searchTerm} readOnly={!isEditable} scrollToColumn={scrollToColumn} registerId={registerId} currentUserName={currentUserName} currentUserId={currentUserId} cellLock={cellLock} />
               )}
@@ -2326,7 +2418,7 @@ export const SpreadsheetRow = React.memo(function SpreadsheetRow(props: Spreadsh
             </div>
           ) : col.type === 'currency' ? (
             typeof entry.cells?.[col.id.toString()] === 'string' && entry.cells[col.id.toString()].includes(' ||| ') ? (
-              <SplitCurrencyCell idx={idx} col={col} entry={entry} colIdx={colIdx} handleCellChange={handleCellChange} visibleColumns={visibleColumns} totalRows={totalRows} readOnly={!canEditCell} scrollToColumn={scrollToColumn} />
+              <SplitCurrencyCell idx={idx} col={col} entry={entry} colIdx={colIdx} handleCellChange={handleCellChange} visibleColumns={visibleColumns} totalRows={totalRows} readOnly={!canEditCell} scrollToColumn={scrollToColumn} registerId={registerId} currentUserName={currentUserName} currentUserId={currentUserId} />
             ) : (
               <CurrencyCell idx={idx} col={col} entry={entry} colIdx={colIdx} handleCellChange={handleCellChange} visibleColumns={visibleColumns} totalRows={totalRows} readOnly={!isEditable} scrollToColumn={scrollToColumn} registerId={registerId} currentUserName={currentUserName} currentUserId={currentUserId} cellLock={cellLock} onKeyDown={(e) => handleCellKeyDown(e, col.id, colIdx)} />
             )
@@ -2342,6 +2434,9 @@ export const SpreadsheetRow = React.memo(function SpreadsheetRow(props: Spreadsh
                 handleCellChange={handleCellChange}
                 readOnly={!canEditCell}
                 scrollToColumn={scrollToColumn}
+                registerId={registerId}
+                currentUserName={currentUserName}
+                currentUserId={currentUserId}
               />
             ) : (
               <SpreadsheetTextInput 
