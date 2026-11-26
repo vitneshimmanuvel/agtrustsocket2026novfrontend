@@ -1,0 +1,1378 @@
+import { useQuery } from '@tanstack/react-query';
+import { 
+  Activity, ArrowLeft, ArrowRight, Calendar, Download, FileText, 
+  Link as LinkIcon, Loader2, Pencil, Plus, RotateCcw, Settings, 
+  Trash2, User, Filter, X, Search, ChevronDown, ChevronUp, Check, RefreshCw
+} from 'lucide-react';
+import React from 'react';
+import { useNavigate } from 'react-router-dom';
+import toast from 'react-hot-toast';
+import { listBusinesses, listHistory, listRegisters, getRegister, getStudentIdentityInfo, type HistoryEntry, type RegisterDetail, type RegisterSummary } from '../lib/api';
+import { useAuth } from '../lib/auth';
+import { firebaseGetUsers } from '../lib/firebaseAuth';
+import { cleanActivityLogs } from '../lib/activityHelper';
+
+const ACTION_OPTIONS = [
+  { value: 'all', label: 'All Action Types' },
+  { value: 'edit_cells', label: 'Cell Edit / Edit Row' },
+  { value: 'add_row', label: 'Add / Insert Row' },
+  { value: 'delete_row', label: 'Delete Row' },
+  { value: 'add_column', label: 'Add Column' },
+  { value: 'delete_column', label: 'Delete Column' },
+  { value: 'Create Register', label: 'Create Register' },
+  { value: 'Restore Register', label: 'Restore Register' },
+  { value: 'Trash Register', label: 'Trash Register' },
+  { value: 'Change Column Type', label: 'Change Column Type' },
+];
+
+export default function HistoryPage() {
+  const navigate = useNavigate();
+  const { user } = useAuth();
+  const { data: businesses } = useQuery({ queryKey: ['businesses'], queryFn: listBusinesses });
+  const businessId = businesses?.[0]?.id;
+
+  const isAdmin = (user as any)?.permissions?.isAdmin === true || 
+                  (user as any)?.permissions?.fullSheetAccess === true || 
+                  user?.role === 'admin' || 
+                  user?.role === 'superadmin' || 
+                  user?.role === 'sheet_admin';
+
+  const [history, setHistory] = React.useState<HistoryEntry[]>([]);
+  const [userList, setUserList] = React.useState<Array<{ id: string; name: string; email?: string }>>([]);
+  const [registerList, setRegisterList] = React.useState<Array<{ id: string; name: string }>>([]);
+  const [isLoading, setIsLoading] = React.useState(true);
+  const [isError, setIsError] = React.useState(false);
+  const [error, setError] = React.useState<any>(null);
+  const [isExporting, setIsExporting] = React.useState(false);
+  
+  const [hasMore, setHasMore] = React.useState(false);
+  const [loadingMore, setLoadingMore] = React.useState(false);
+
+  // Filter States
+  const [filterUser, setFilterUser] = React.useState<string>('all');
+  const [filterRegister, setFilterRegister] = React.useState<string>('all');
+  const [filterAction, setFilterAction] = React.useState<string>('all');
+  const [filterSingleDate, setFilterSingleDate] = React.useState<string>('');
+  const [filterDateFrom, setFilterDateFrom] = React.useState<string>('');
+  const [filterDateTo, setFilterDateTo] = React.useState<string>('');
+  const [searchQuery, setSearchQuery] = React.useState<string>('');
+  const [showFilters, setShowFilters] = React.useState<boolean>(false);
+
+  const containerRef = React.useRef<HTMLDivElement>(null);
+
+  // Fetch users & registers for filter dropdowns
+  React.useEffect(() => {
+    async function loadFilterOptions() {
+      try {
+        if (isAdmin) {
+          const uRes = await firebaseGetUsers();
+          if (uRes?.users) {
+            setUserList(uRes.users.map((u: any) => ({ id: String(u.id), name: u.name, email: u.email })));
+          }
+        }
+        if (businessId) {
+          const rList = await listRegisters(businessId);
+          if (rList) {
+            setRegisterList(rList.map((r: any) => ({ id: String(r.id), name: r.name })));
+          }
+        }
+      } catch (err) {
+        console.warn('Could not load extra filter options:', err);
+      }
+    }
+    loadFilterOptions();
+  }, [isAdmin, businessId]);
+
+  const fetchHistory = async (overrideParams?: { date?: string; userId?: string; registerId?: string; startDate?: string; endDate?: string }) => {
+    setIsLoading(true);
+    setIsError(false);
+
+    try {
+      if (!businessId) return;
+      const params = {
+        date: overrideParams ? overrideParams.date : (filterSingleDate || undefined),
+        startDate: overrideParams ? overrideParams.startDate : (filterDateFrom || undefined),
+        endDate: overrideParams ? overrideParams.endDate : (filterDateTo || undefined),
+        userId: overrideParams ? overrideParams.userId : (filterUser !== 'all' ? filterUser : undefined),
+        registerId: overrideParams ? overrideParams.registerId : (filterRegister !== 'all' ? filterRegister : undefined),
+        limit: 3000
+      };
+
+      const newItems = await listHistory(businessId, params);
+      setHistory(newItems || []);
+      setHasMore(false);
+
+      // Asynchronously enrich history logs with live Student Name & RB Number from registers
+      const uniqueRegIds = Array.from(
+        new Set((newItems || []).map((h: any) => h.registerId).filter(Boolean))
+      ) as number[];
+
+      const regMap = new Map<number, RegisterDetail>();
+      await Promise.all(
+        uniqueRegIds.map(async (rid) => {
+          try {
+            const reg = await getRegister(rid, false);
+            if (reg) regMap.set(rid, reg);
+          } catch (e) {
+            console.warn(`Could not load register #${rid} for history enrichment:`, e);
+          }
+        })
+      );
+
+      // Map student name & RB number into each history item
+      const enriched = (newItems || []).map((entry: any) => {
+        if (!entry.registerId || !entry.entryId) return entry;
+        const reg = regMap.get(Number(entry.registerId));
+        if (!reg) return entry;
+
+        let targetEntry = reg.entries?.find((e: any) => String(e.id) === String(entry.entryId));
+        if (!targetEntry && reg.deletedItems) {
+          const delItem = reg.deletedItems.find((d: any) => d.type === 'row' && d.entry && String(d.entry.id) === String(entry.entryId));
+          if (delItem) targetEntry = delItem.entry;
+        }
+
+        if (targetEntry && targetEntry.cells) {
+          const studentInfo = getStudentIdentityInfo(reg.columns, targetEntry.cells);
+          if (studentInfo) {
+            return {
+              ...entry,
+              studentInfo
+            };
+          }
+        }
+        return entry;
+      });
+
+      setHistory(enriched);
+    } catch (err: any) {
+      console.error("Fetch history failed:", err);
+      setIsError(true);
+      setError(err);
+    } finally {
+      setIsLoading(false);
+      setLoadingMore(false);
+    }
+  };
+
+  React.useEffect(() => {
+    if (businessId) {
+      fetchHistory();
+    }
+  }, [businessId, filterSingleDate, filterDateFrom, filterDateTo, filterUser, filterRegister]);
+
+  // Derive unique users and registers from history items as well
+  const availableUsers = React.useMemo(() => {
+    const map = new Map<string, string>();
+    userList.forEach(u => map.set(u.id, u.name));
+    history.forEach(h => {
+      if (h.userId && h.userName) map.set(String(h.userId), h.userName);
+      else if (h.userName) map.set(h.userName, h.userName);
+    });
+    return Array.from(map.entries()).map(([id, name]) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name));
+  }, [userList, history]);
+
+  const availableRegisters = React.useMemo(() => {
+    const map = new Map<string, string>();
+    registerList.forEach(r => map.set(r.id, r.name));
+    history.forEach(h => {
+      if (h.registerId && h.registerName) map.set(String(h.registerId), h.registerName);
+      else if (h.registerName) map.set(h.registerName, h.registerName);
+    });
+    return Array.from(map.entries()).map(([id, name]) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name));
+  }, [registerList, history]);
+
+  // Active filter count
+  const activeFilterCount = React.useMemo(() => {
+    let count = 0;
+    if (filterUser !== 'all') count++;
+    if (filterRegister !== 'all') count++;
+    if (filterAction !== 'all') count++;
+    if (filterSingleDate) count++;
+    if (filterDateFrom || filterDateTo) count++;
+    if (searchQuery.trim()) count++;
+    return count;
+  }, [filterUser, filterRegister, filterAction, filterSingleDate, filterDateFrom, filterDateTo, searchQuery]);
+
+  const clearAllFilters = () => {
+    setFilterUser('all');
+    setFilterRegister('all');
+    setFilterAction('all');
+    setFilterSingleDate('');
+    setFilterDateFrom('');
+    setFilterDateTo('');
+    setSearchQuery('');
+  };
+
+  const filteredHistory = React.useMemo(() => {
+    if (!history) return [];
+    const cleaned = cleanActivityLogs(history);
+
+    return cleaned.filter(entry => {
+      // 1. Non-admin scoping: only own changes
+      if (!isAdmin) {
+        const isMine = (entry.userId && user?.id && String(entry.userId) === String(user.id)) ||
+          (entry.userEmail && user?.email && entry.userEmail.toLowerCase() === user.email.toLowerCase()) ||
+          (!entry.userId && !entry.userEmail && entry.userName && user?.name && entry.userName.toLowerCase() === user.name.toLowerCase());
+        if (!isMine) return false;
+      }
+
+      // 2. User/Staff Filter
+      if (filterUser !== 'all') {
+        const matchUserId = entry.userId && String(entry.userId) === String(filterUser);
+        const matchUserName = entry.userName && entry.userName.toLowerCase() === filterUser.toLowerCase();
+        const matchUserEmail = entry.userEmail && entry.userEmail.toLowerCase() === filterUser.toLowerCase();
+        if (!matchUserId && !matchUserName && !matchUserEmail) return false;
+      }
+
+      // 3. Register Filter
+      if (filterRegister !== 'all') {
+        const matchRegId = entry.registerId && String(entry.registerId) === String(filterRegister);
+        const matchRegName = entry.registerName && entry.registerName.toLowerCase() === filterRegister.toLowerCase();
+        if (!matchRegId && !matchRegName) return false;
+      }
+
+      // 4. Action Type Filter
+      if (filterAction !== 'all') {
+        const act = (entry.action || '').toLowerCase();
+        const target = filterAction.toLowerCase();
+        if (target === 'edit_cells') {
+          if (act !== 'edit_cells' && act !== 'edit row') return false;
+        } else if (target === 'add_row') {
+          if (act !== 'add_row' && act !== 'add row' && act !== 'insert row') return false;
+        } else if (target === 'delete_row') {
+          if (act !== 'delete_row' && act !== 'delete row' && act !== 'delete rows' && act !== 'bulk_delete_rows') return false;
+        } else {
+          if (!act.includes(target)) return false;
+        }
+      }
+
+      // 5. Specific Date Filter (Timezone-safe for IST & Local)
+      if (filterSingleDate) {
+        const d = new Date(entry.timestamp);
+        const istDateStr = d.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        const localDateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        if (istDateStr !== filterSingleDate && localDateStr !== filterSingleDate) return false;
+      }
+
+      // 6. Date Range: From
+      if (filterDateFrom) {
+        const from = new Date(filterDateFrom);
+        from.setHours(0, 0, 0, 0);
+        if (new Date(entry.timestamp) < from) return false;
+      }
+
+      // 7. Date Range: To
+      if (filterDateTo) {
+        const to = new Date(filterDateTo);
+        to.setHours(23, 59, 59, 999);
+        if (new Date(entry.timestamp) > to) return false;
+      }
+
+      // 8. Search Query
+      if (searchQuery.trim()) {
+        const q = searchQuery.toLowerCase().trim();
+        const nameMatch = entry.userName?.toLowerCase().includes(q);
+        const emailMatch = entry.userEmail?.toLowerCase().includes(q);
+        const regMatch = entry.registerName?.toLowerCase().includes(q);
+        const actMatch = entry.action?.toLowerCase().includes(q);
+        const detailsMatch = entry.details?.toLowerCase().includes(q);
+        const studentMatch = (entry as any).studentInfo?.toLowerCase().includes(q);
+        if (!nameMatch && !emailMatch && !regMatch && !actMatch && !detailsMatch && !studentMatch) return false;
+      }
+
+      return true;
+    });
+  }, [history, isAdmin, user, filterUser, filterRegister, filterAction, filterSingleDate, filterDateFrom, filterDateTo, searchQuery]);
+
+  const handleExportExcel = async () => {
+    if (!isAdmin) {
+      toast.error('Only Admin users are allowed to download history');
+      return;
+    }
+    if (!filteredHistory || filteredHistory.length === 0) {
+      toast.error('No history records available to download');
+      return;
+    }
+
+    setIsExporting(true);
+    try {
+      const XLSX = await import('xlsx');
+      const rows = filteredHistory.map((entry, idx) => {
+        const idInfo = extractStudentIdentityFromDetails(entry.details);
+        return {
+          'S.No.': idx + 1,
+          'User Name': entry.userName || 'System / Unknown',
+          'User Email': entry.userEmail || '—',
+          'Register Name': entry.registerName || 'System',
+          'RB Number': idInfo.rb || '—',
+          'Student Name': idInfo.name || '—',
+          'Action': entry.action || '—',
+          'Details & Content': entry.details || '—',
+          'Date': new Date(entry.timestamp).toLocaleDateString('en-IN'),
+          'Time': new Date(entry.timestamp).toLocaleTimeString('en-IN'),
+          'Timestamp ISO': entry.timestamp
+        };
+      });
+
+      const ws = XLSX.utils.json_to_sheet(rows);
+      ws['!cols'] = [
+        { wch: 8 },  // S.No
+        { wch: 22 }, // User Name
+        { wch: 26 }, // User Email
+        { wch: 24 }, // Register Name
+        { wch: 16 }, // RB Number
+        { wch: 22 }, // Student Name
+        { wch: 18 }, // Action
+        { wch: 55 }, // Details
+        { wch: 14 }, // Date
+        { wch: 14 }, // Time
+        { wch: 24 }, // ISO Timestamp
+      ];
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'History Log');
+
+      const dateStr = new Date().toISOString().split('T')[0];
+      XLSX.writeFile(wb, `Activity_History_Log_${dateStr}.xlsx`);
+      toast.success('History log downloaded successfully');
+    } catch (err: any) {
+      console.error('Failed to export history log:', err);
+      toast.error('Failed to export history log');
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  return (
+    <div className="history-page" ref={containerRef}>
+      <div className="history-header">
+        <div className="history-header-left">
+          <button className="back-button" onClick={() => navigate('/')} title="Back to Home">
+            <ArrowLeft size={18} />
+          </button>
+          <div className="header-title-group">
+            <h1 className="header-title">History</h1>
+            <p className="header-subtitle">
+              {isAdmin 
+                ? 'All changes and actions made across registers' 
+                : 'Your personal changes and actions made across registers'}
+            </p>
+          </div>
+        </div>
+
+        {/* ── Sleek Compact Header Filter Controls ── */}
+        <div className="history-header-filters">
+          {/* 1. Live Search Input */}
+          <div className="history-search-pill">
+            <Search size={14} className="search-pill-icon" />
+            <input 
+              type="text" 
+              placeholder="Search history, student..." 
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+            />
+            {searchQuery && (
+              <button className="search-clear-btn" onClick={() => setSearchQuery('')} title="Clear search">
+                <X size={12} />
+              </button>
+            )}
+          </div>
+
+          {/* 2. Staff Member Filter (Admin only) */}
+          {isAdmin && availableUsers.length > 0 && (
+            <div className="history-select-pill">
+              <User size={13} className="select-pill-icon" />
+              <select 
+                value={filterUser} 
+                onChange={(e) => setFilterUser(e.target.value)}
+                title="Filter by User / Staff"
+              >
+                <option value="all">All Users</option>
+                {availableUsers.map(u => (
+                  <option key={u.id} value={u.id}>{u.name}</option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {/* 3. Target Register Filter */}
+          <div className="history-select-pill">
+            <FileText size={13} className="select-pill-icon" />
+            <select 
+              value={filterRegister} 
+              onChange={(e) => setFilterRegister(e.target.value)}
+              title="Filter by Register"
+            >
+              <option value="all">All Registers</option>
+              {availableRegisters.map(r => (
+                <option key={r.id} value={r.id}>{r.name}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* 4. Date Picker */}
+          <div className="history-date-pill">
+            <Calendar size={13} className="select-pill-icon" />
+            <input 
+              type="date" 
+              value={filterSingleDate} 
+              onChange={(e) => setFilterSingleDate(e.target.value)}
+              title="Filter by Date"
+            />
+            {filterSingleDate && (
+              <button className="date-clear-btn" onClick={() => setFilterSingleDate('')} title="Clear date">
+                <X size={12} />
+              </button>
+            )}
+          </div>
+
+          {/* 5. Reset Button (Appears only when filter is applied) */}
+          {activeFilterCount > 0 && (
+            <button className="history-reset-pill-btn" onClick={clearAllFilters} title="Reset all filters">
+              <RotateCcw size={12} />
+              <span>Reset</span>
+            </button>
+          )}
+
+          {/* 6. Refresh Button */}
+          <button 
+            className="history-refresh-pill-btn"
+            onClick={() => fetchHistory()}
+            disabled={isLoading}
+            title="Refresh history logs"
+          >
+            <RefreshCw size={14} className={isLoading ? 'animate-spin' : ''} />
+          </button>
+
+          {/* 7. Download Button */}
+          {isAdmin && (
+            <button
+              className="history-download-btn"
+              onClick={handleExportExcel}
+              disabled={isExporting || isLoading || filteredHistory.length === 0}
+              title="Download activity history report (Admin only)"
+            >
+              {isExporting ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+              <span>Download</span>
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* ── Active Results Count Indicator (Subtle bar if filters are on) ── */}
+      {activeFilterCount > 0 && (
+        <div className="history-active-filter-strip">
+          <span>
+            Showing <strong>{filteredHistory.length}</strong> of <strong>{history.length}</strong> records
+          </span>
+          <button onClick={clearAllFilters} className="strip-clear-link">
+            Clear Filters
+          </button>
+        </div>
+      )}
+
+      <div className="history-content">
+        {isLoading ? (
+          <div className="loading-state">
+            <Activity size={32} style={{ opacity: 0.3, marginBottom: 12 }} />
+            <p>Loading history...</p>
+          </div>
+        ) : isError ? (
+          <div className="empty-state" style={{ color: '#ef4444' }}>
+            <Activity size={48} className="empty-icon" />
+            <p style={{ fontWeight: 600 }}>Failed to load history</p>
+            <p style={{ fontSize: 13, marginTop: 4, color: '#64748b' }}>
+              {(error as any)?.message || 'An unknown error occurred. Check your internet connection.'}
+            </p>
+          </div>
+        ) : !filteredHistory || filteredHistory.length === 0 ? (
+          <div className="empty-state">
+            <Activity size={48} className="empty-icon" />
+            <p style={{ fontWeight: 600, fontSize: '15px' }}>
+              {activeFilterCount > 0 ? 'No matching history records' : 'No history recorded yet.'}
+            </p>
+            <p style={{ fontSize: 13, marginTop: 4 }}>
+              {activeFilterCount > 0 
+                ? 'Try adjusting your filters or search query to find records.' 
+                : 'Actions like adding rows, creating registers, and editing data will appear here.'}
+            </p>
+            {activeFilterCount > 0 && (
+              <button 
+                onClick={clearAllFilters}
+                style={{
+                  marginTop: '16px',
+                  padding: '8px 16px',
+                  borderRadius: '8px',
+                  border: '1px solid #cbd5e1',
+                  background: 'white',
+                  color: '#475569',
+                  fontSize: '13px',
+                  fontWeight: 600,
+                  cursor: 'pointer'
+                }}
+              >
+                Clear Filters
+              </button>
+            )}
+          </div>
+        ) : (
+          <div className="history-timeline">
+            {filteredHistory.map((entry: HistoryEntry) => (
+              <HistoryCard key={entry.id} entry={entry} navigate={navigate} />
+            ))}
+          </div>
+        )}
+        {loadingMore && (
+          <div className="loading-state" style={{ padding: '20px 0' }}>
+            <Activity size={24} className="animate-spin" style={{ opacity: 0.5, marginBottom: 8, display: 'inline-block' }} />
+            <p style={{ fontSize: 13, margin: 0 }}>Loading more history...</p>
+          </div>
+        )}
+        {!loadingMore && hasMore && history.length > 0 && (
+          <div style={{ textAlign: 'center', padding: '20px 0' }}>
+            <button 
+              onClick={() => fetchHistory()}
+              style={{
+                padding: '8px 16px',
+                borderRadius: '8px',
+                border: '1px solid #e2e8f0',
+                background: 'white',
+                color: '#64748b',
+                fontSize: '13px',
+                fontWeight: 600,
+                cursor: 'pointer'
+              }}
+            >
+              Load More
+            </button>
+          </div>
+        )}
+      </div>
+
+      <style>{`
+      .history-page {
+        flex: 1;
+        background: #f8fafc;
+        height: 100vh;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .history-header {
+        background: white;
+        padding: 16px 28px;
+        border-bottom: 1px solid #e2e8f0;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        flex-wrap: wrap;
+      }
+
+      .history-header-left {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+      }
+
+      .history-header-filters {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      /* ── Inline Search Pill ── */
+      .history-search-pill {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        background: #f8fafc;
+        border: 1.5px solid #e2e8f0;
+        border-radius: 8px;
+        padding: 0 10px;
+        height: 36px;
+        transition: all 0.2s;
+      }
+
+      .history-search-pill:focus-within {
+        border-color: #6366f1;
+        background: white;
+        box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+      }
+
+      .search-pill-icon {
+        color: #94a3b8;
+        flex-shrink: 0;
+      }
+
+      .history-search-pill input {
+        border: none;
+        background: transparent;
+        outline: none;
+        font-size: 12.5px;
+        color: #1e293b;
+        width: 170px;
+        transition: width 0.2s;
+      }
+
+      .history-search-pill input:focus {
+        width: 210px;
+      }
+
+      .search-clear-btn, .date-clear-btn {
+        background: none;
+        border: none;
+        color: #94a3b8;
+        cursor: pointer;
+        padding: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .search-clear-btn:hover, .date-clear-btn:hover {
+        color: #475569;
+      }
+
+      /* ── Inline Dropdown & Date Pills ── */
+      .history-select-pill, .history-date-pill {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        background: #f8fafc;
+        border: 1.5px solid #e2e8f0;
+        border-radius: 8px;
+        padding: 0 10px;
+        height: 36px;
+        transition: all 0.15s;
+      }
+
+      .history-select-pill:hover, .history-date-pill:hover {
+        border-color: #cbd5e1;
+        background: white;
+      }
+
+      .select-pill-icon {
+        color: #64748b;
+        flex-shrink: 0;
+      }
+
+      .history-select-pill select {
+        border: none;
+        background: transparent;
+        outline: none;
+        font-size: 12px;
+        font-weight: 600;
+        color: #334155;
+        cursor: pointer;
+        max-width: 140px;
+      }
+
+      .history-date-pill input {
+        border: none;
+        background: transparent;
+        outline: none;
+        font-size: 12px;
+        font-weight: 600;
+        color: #334155;
+        cursor: pointer;
+      }
+
+      /* ── Reset & Refresh Buttons ── */
+      .history-reset-pill-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        height: 36px;
+        padding: 0 12px;
+        border-radius: 8px;
+        border: 1px solid #fecaca;
+        background: #fef2f2;
+        color: #dc2626;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.15s;
+      }
+
+      .history-reset-pill-btn:hover {
+        background: #fee2e2;
+        border-color: #f87171;
+      }
+
+      .history-refresh-pill-btn {
+        width: 36px;
+        height: 36px;
+        border-radius: 8px;
+        border: 1.5px solid #e2e8f0;
+        background: white;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        transition: all 0.15s;
+        color: #64748b;
+      }
+
+      .history-refresh-pill-btn:hover:not(:disabled) {
+        background: #f1f5f9;
+        color: #0f172a;
+        border-color: #cbd5e1;
+      }
+
+      .history-download-btn {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        height: 36px;
+        padding: 0 14px;
+        border-radius: 8px;
+        background: linear-gradient(135deg, var(--navy) 0%, #1e3a8a 100%);
+        color: white;
+        font-size: 12.5px;
+        font-weight: 600;
+        border: none;
+        cursor: pointer;
+        transition: all 0.2s;
+        box-shadow: 0 2px 4px rgba(30, 58, 138, 0.2);
+        flex-shrink: 0;
+      }
+
+      .history-download-btn:hover:not(:disabled) {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 8px rgba(30, 58, 138, 0.3);
+        background: linear-gradient(135deg, #1e3a8a 0%, #1e293b 100%);
+      }
+
+      .history-download-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+        transform: none;
+        box-shadow: none;
+      }
+
+      /* ── Active Filter Strip ── */
+      .history-active-filter-strip {
+        background: #f1f5f9;
+        border-bottom: 1px solid #e2e8f0;
+        padding: 8px 28px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-size: 12.5px;
+        color: #475569;
+      }
+
+      .strip-clear-link {
+        background: none;
+        border: none;
+        color: #4f46e5;
+        font-size: 12px;
+        font-weight: 700;
+        cursor: pointer;
+        padding: 0;
+      }
+
+      .strip-clear-link:hover {
+        text-decoration: underline;
+      }
+
+      .back-button {
+        width: 40px;
+        height: 40px;
+        border-radius: 10px;
+        border: 1px solid #e2e8f0;
+        background: white;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        transition: all 0.2s;
+        color: #64748b;
+      }
+
+      .back-button:hover {
+        background: #f1f5f9;
+        color: var(--navy);
+        border-color: var(--navy);
+      }
+
+      .header-title-group .header-title {
+        font-size: 20px;
+        font-weight: 700;
+        color: #1e293b;
+        margin: 0;
+      }
+
+      .header-title-group .header-subtitle {
+        font-size: 14px;
+        color: #64748b;
+        margin: 4px 0 0;
+      }
+
+      .history-content {
+        padding: 32px;
+        max-width: 900px;
+        margin: 0 auto;
+        width: 100%;
+      }
+
+      .history-timeline {
+        display: flex;
+        flex-direction: column;
+        gap: 0;
+      }
+
+      .history-card {
+        display: flex;
+        gap: 24px;
+      }
+
+      .history-card-icon {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        flex-shrink: 0;
+      }
+
+      .icon-circle {
+        width: 40px;
+        height: 40px;
+        border-radius: 50%;
+        background: white;
+        border: 2px solid #e2e8f0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 1;
+        flex-shrink: 0;
+      }
+
+      .timeline-connector {
+        flex: 1;
+        width: 2px;
+        background: #e2e8f0;
+        margin: 4px 0;
+        min-height: 20px;
+      }
+
+      .history-card:last-child .timeline-connector {
+        display: none;
+      }
+
+      .history-card-main {
+        flex: 1;
+        background: white;
+        border-radius: 12px;
+        padding: 20px;
+        border: 1px solid #e2e8f0;
+        margin-bottom: 24px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        transition: transform 0.2s, box-shadow 0.2s;
+      }
+
+      .history-card-main:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
+      }
+
+      .history-card-clickable .history-card-main:hover {
+        border-color: #a5b4fc;
+        box-shadow: 0 4px 12px -2px rgba(99,102,241,0.2);
+      }
+
+      .history-card-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 12px;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .action-badge {
+        padding: 4px 10px;
+        border-radius: 6px;
+        font-size: 12px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+
+      .timestamp {
+        font-size: 12px;
+        color: #94a3b8;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .history-details {
+        font-size: 15px;
+        color: #1e293b;
+        line-height: 1.5;
+        margin: 0 0 16px;
+      }
+
+      .history-details-title {
+        font-size: 15px;
+        color: #1e293b;
+        line-height: 1.5;
+        font-weight: 600;
+        margin: 0 0 8px;
+      }
+
+      .history-changes-container {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        width: 100%;
+        margin-bottom: 16px;
+      }
+
+      .changes-table-wrapper {
+        width: 100%;
+        overflow-x: auto;
+        margin: 12px 0;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        background: white;
+      }
+
+      .changes-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+        text-align: left;
+      }
+
+      .changes-table th {
+        background: #f8fafc;
+        color: #475569;
+        font-weight: 600;
+        padding: 10px 14px;
+        border-bottom: 1px solid #e2e8f0;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+
+      .changes-table td {
+        padding: 10px 14px;
+        border-bottom: 1px solid #f1f5f9;
+        vertical-align: middle;
+      }
+
+      .changes-table tr:last-child td {
+        border-bottom: none;
+      }
+
+      .col-name {
+        font-weight: 600;
+        color: #334155;
+      }
+
+      .change-from {
+        color: #b91c1c;
+        background: #fef2f2;
+        border: 1px solid #fee2e2;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 12px;
+        max-width: 180px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        display: inline-block;
+      }
+
+      .change-to {
+        color: #15803d;
+        font-weight: 600;
+        background: #f0fdf4;
+        border: 1px solid #dcfce7;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 12px;
+        max-width: 180px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        display: inline-block;
+      }
+
+      .empty-val {
+        font-style: italic;
+        color: #94a3b8;
+      }
+
+      .expand-changes-btn {
+        align-self: flex-start;
+        background: #f1f5f9;
+        border: 1px solid #e2e8f0;
+        color: #4f46e5;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        padding: 6px 12px;
+        margin-top: 4px;
+        border-radius: 6px;
+        transition: all 0.2s;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+      }
+
+      .expand-changes-btn:hover {
+        background: #e2e8f0;
+        color: #3730a3;
+        border-color: #cbd5e1;
+      }
+
+      .history-meta {
+        display: flex;
+        gap: 16px;
+        flex-wrap: wrap;
+        border-top: 1px solid #f1f5f9;
+        padding-top: 12px;
+      }
+
+      .meta-item {
+        font-size: 12px;
+        color: #64748b;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .loading-state, .empty-state {
+        text-align: center;
+        padding: 60px 0;
+        color: #64748b;
+      }
+
+      .empty-icon {
+        margin-bottom: 16px;
+        opacity: 0.3;
+      }
+    `}</style>
+    </div>
+  );
+}
+
+interface HistoryCardProps {
+  entry: HistoryEntry;
+  navigate: ReturnType<typeof useNavigate>;
+}
+
+function extractStudentIdentityFromDetails(details: string, changes: Array<{ column: string; from: string; to: string }> = [], studentInfo?: string) {
+  const combinedText = [studentInfo, details].filter(Boolean).join(' ');
+  if (!combinedText && (!changes || changes.length === 0)) return { rb: null, name: null };
+  let rb: string | null = null;
+  let name: string | null = null;
+
+  // 1. Structured tag check [RB: X | Student: Y]
+  const tagMatch = combinedText.match(/\[(?:RB:\s*([^\|\]]+))?(?:\s*\|\s*)?(?:Student:\s*([^\]]+))?\]/i);
+  if (tagMatch) {
+    if (tagMatch[1]) rb = tagMatch[1].trim();
+    if (tagMatch[2]) name = tagMatch[2].trim();
+  }
+
+  // 2. Details regex check for RB
+  if (!rb && combinedText) {
+    const rbMatch = combinedText.match(/(?:rb\s*number|rb\s*no|rb|roll\s*no|register\s*no)\s*(?:changed\s+from\s+".*?"\s+to\s+"|is\s+|=|\:)\s*"?(.*?)"?(?:\s*,|\s*$|\]|\:)/i);
+    if (rbMatch && rbMatch[1] && rbMatch[1] !== 'empty') {
+      rb = rbMatch[1].trim();
+    }
+  }
+
+  // 3. Details regex check for Name
+  if (!name && combinedText) {
+    const nameMatch = combinedText.match(/(?:student\s*name|candidate\s*name|student|name)\s*(?:changed\s+from\s+".*?"\s+to\s+"|is\s+|=|\:)\s*"?(.*?)"?(?:\s*,|\s*$|\]|\:)/i);
+    if (nameMatch && nameMatch[1] && nameMatch[1] !== 'empty') {
+      name = nameMatch[1].trim();
+    }
+  }
+
+  // 4. Fallback to inspecting changes list
+  if (changes && Array.isArray(changes)) {
+    for (const change of changes) {
+      const colLower = (change.column || '').toLowerCase().trim();
+      const val = (change.to || change.from || '').trim();
+      if (!val || val === 'empty') continue;
+
+      if (!rb && (colLower === 'rb number' || colLower === 'rb no' || colLower === 'rb' || colLower === 'roll no' || colLower === 'register no' || colLower === 'reg no')) {
+        rb = val;
+      }
+      if (!name && (colLower === 'student name' || colLower === 'name' || colLower === 'student' || colLower === 'candidate name' || colLower === 'full name')) {
+        name = val;
+      }
+    }
+  }
+
+  return { rb, name };
+}
+
+function HistoryCard({ entry, navigate }: HistoryCardProps) {
+  const [isExpanded, setIsExpanded] = React.useState(false);
+  const { icon, color, bg } = getActionStyle(entry.action);
+
+  const parsed = React.useMemo(() => parseDetails(entry.details, entry.action), [entry.details, entry.action]);
+  const identity = React.useMemo(() => extractStudentIdentityFromDetails(entry.details, parsed.changes, (entry as any).studentInfo), [entry.details, parsed.changes, (entry as any).studentInfo]);
+
+  return (
+    <div className={`history-card${entry.registerId ? ' history-card-clickable' : ''}`}
+      onClick={() => {
+        if (entry.registerId && entry.entryId) {
+          navigate(`/register/${entry.registerId}?row=${entry.entryId}`);
+        } else if (entry.registerId) {
+          navigate(`/register/${entry.registerId}`);
+        }
+      }}
+      style={{ cursor: entry.registerId ? 'pointer' : 'default' }}
+    >
+      <div className="history-card-icon">
+        <div className="icon-circle" style={{ borderColor: color, background: bg }}>
+          <span style={{ color }}>{icon}</span>
+        </div>
+        <div className="timeline-connector" />
+      </div>
+      <div className="history-card-main">
+        <div className="history-card-header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+            <span className="action-badge" style={{ background: bg, color }}>
+              {entry.action}
+            </span>
+          </div>
+          <span className="timestamp">
+            <Calendar size={12} />
+            {new Intl.DateTimeFormat('en-IN', {
+              day: 'numeric',
+              month: 'short',
+              year: 'numeric',
+              hour: 'numeric',
+              minute: '2-digit',
+              hour12: true
+            }).format(new Date(entry.timestamp))}
+          </span>
+        </div>
+
+        {/* ── Prominent Student Identity Banner ── */}
+        {(identity.name || identity.rb) && (
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px',
+            background: 'linear-gradient(135deg, rgba(99, 102, 241, 0.08) 0%, rgba(79, 70, 229, 0.12) 100%)',
+            border: '1px solid rgba(99, 102, 241, 0.25)',
+            padding: '6px 12px',
+            borderRadius: '8px',
+            margin: '8px 0 10px 0',
+            fontSize: '13px',
+            fontWeight: 700,
+            color: '#3730a3'
+          }}>
+            <User size={14} color="#4f46e5" />
+            <span>Student: <strong style={{ color: '#1e1b4b' }}>{identity.name || 'N/A'}</strong></span>
+            {identity.rb && (
+              <span style={{ fontSize: '11px', background: '#4f46e5', color: '#ffffff', padding: '2px 8px', borderRadius: '99px', marginLeft: 'auto' }}>
+                RB No: {identity.rb}
+              </span>
+            )}
+          </div>
+        )}
+        
+        {parsed.isEditRow && parsed.changes.length > 0 ? (
+          <div className="history-changes-container">
+            <p className="history-details-title">{parsed.title}</p>
+            <div className="changes-table-wrapper" onClick={(e) => e.stopPropagation()}>
+              <table className="changes-table">
+                <thead>
+                  <tr>
+                    <th>Field</th>
+                    <th>Before</th>
+                    <th>After</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(isExpanded ? parsed.changes : parsed.changes.slice(0, 3)).map((change, idx) => (
+                    <tr key={idx}>
+                      <td className="col-name">{change.column}</td>
+                      <td>
+                        {isImageValue(change.from) ? (
+                          <div className="history-value-images from">
+                            {change.from.split('|||').map((url, i) => (
+                              <img 
+                                key={i} 
+                                src={url.trim()} 
+                                alt="Before" 
+                                className="history-image-preview" 
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  window.open(url.trim(), '_blank');
+                                }}
+                              />
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="change-from">
+                            {change.from || <span className="empty-val">empty</span>}
+                          </span>
+                        )}
+                      </td>
+                      <td>
+                        {isImageValue(change.to) ? (
+                          <div className="history-value-images to">
+                            {change.to.split('|||').map((url, i) => (
+                              <img 
+                                key={i} 
+                                src={url.trim()} 
+                                alt="After" 
+                                className="history-image-preview" 
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  window.open(url.trim(), '_blank');
+                                }}
+                              />
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="change-to">
+                            {change.to || <span className="empty-val">empty</span>}
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {parsed.changes.length > 3 && (
+              <button
+                className="expand-changes-btn"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setIsExpanded(!isExpanded);
+                }}
+              >
+                {isExpanded ? 'Show less' : `+ ${parsed.changes.length - 3} more changes`}
+              </button>
+            )}
+          </div>
+        ) : (
+          <p className="history-details">{entry.details}</p>
+        )}
+
+        <div className="history-meta">
+          {entry.userName && (
+            <span className="meta-item">
+              <User size={12} />
+              {entry.userName}
+            </span>
+          )}
+          {entry.registerName && (
+            <span className="meta-item">
+              <FileText size={12} />
+              {entry.registerName}
+            </span>
+          )}
+          {entry.registerId && (
+            <span className="meta-item" style={{ marginLeft: 'auto', color: '#6366f1', fontWeight: 600, fontSize: 11 }}>
+              View in Register <ArrowRight size={11} />
+            </span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function isImageValue(val: string): boolean {
+  if (!val) return false;
+  const urls = val.split('|||');
+  return urls.every(url => {
+    const u = url.trim();
+    return u.startsWith('http://') || u.startsWith('https://') || u.startsWith('data:image/');
+  }) && urls.some(url => {
+    const u = url.trim().toLowerCase();
+    return u.includes('cloudinary.com') || u.includes('/image/upload/') || u.endsWith('.png') || u.endsWith('.jpg') || u.endsWith('.jpeg') || u.endsWith('.gif') || u.endsWith('.webp');
+  });
+}
+
+function parseDetails(details: string, action: string) {
+  const isEdit = action.toLowerCase() === 'edit row' || action.toLowerCase() === 'edit_cells';
+  if (!isEdit || !details.includes('changed from')) {
+    return { isEditRow: false, title: details, changes: [] };
+  }
+
+  const parts = details.split(': ');
+  if (parts.length < 2) {
+    return { isEditRow: true, title: details, changes: [] };
+  }
+
+  const title = parts[0];
+  const changesStr = parts.slice(1).join(': ');
+
+  const changes: Array<{ column: string; from: string; to: string }> = [];
+  let currentToken = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < changesStr.length; i++) {
+    const char = changesStr[i];
+    if (char === '"') {
+      inQuotes = !inQuotes;
+      currentToken += char;
+    } else if (char === ',' && !inQuotes) {
+      const trimmed = currentToken.trim();
+      if (trimmed) {
+        changes.push(parseSingleChange(trimmed));
+      }
+      currentToken = '';
+      if (changesStr[i + 1] === ' ') {
+        i++;
+      }
+    } else {
+      currentToken += char;
+    }
+  }
+
+  const finalTrimmed = currentToken.trim();
+  if (finalTrimmed) {
+    changes.push(parseSingleChange(finalTrimmed));
+  }
+
+  return {
+    isEditRow: true,
+    title,
+    changes: changes.filter(c => c.column !== '')
+  };
+}
+
+function parseSingleChange(part: string): { column: string; from: string; to: string } {
+  const match = part.match(/(.+?)\s+changed\s+from\s+"(.*?)"\s+to\s+"(.*?)"$/);
+  if (match) {
+    return {
+      column: match[1].trim(),
+      from: match[2],
+      to: match[3]
+    };
+  }
+  return { column: '', from: '', to: part };
+}
+
+function getActionStyle(action: string): { icon: React.ReactNode; color: string; bg: string } {
+  const a = action.toLowerCase();
+  if (a.includes('add row') || a.includes('create')) return { icon: <Plus size={16} />, color: '#10b981', bg: '#ecfdf5' };
+  if (a.includes('delete')) return { icon: <Trash2 size={16} />, color: '#ef4444', bg: '#fef2f2' };
+  if (a.includes('rename') || a.includes('edit')) return { icon: <Pencil size={16} />, color: '#3b82f6', bg: '#eff6ff' };
+  if (a.includes('link')) return { icon: <LinkIcon size={16} />, color: '#8b5cf6', bg: '#f5f3ff' };
+  if (a.includes('restore')) return { icon: <RotateCcw size={16} />, color: '#f59e0b', bg: '#fffbeb' };
+  if (a.includes('column') || a.includes('type')) return { icon: <Settings size={16} />, color: '#8b5cf6', bg: '#f5f3ff' };
+  return { icon: <Activity size={16} />, color: '#64748b', bg: '#f1f5f9' };
+}
+
