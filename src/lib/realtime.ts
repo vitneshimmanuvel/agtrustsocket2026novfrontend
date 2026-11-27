@@ -46,7 +46,7 @@ function getUserColor(userId: string | number): string {
 
 function getStoredAuthToken(): string | null {
   try {
-    return sessionStorage.getItem('recordbook_token') || localStorage.getItem('recordbook_token');
+    return sessionStorage.getItem('recordbook_token');
   } catch {
     return null;
   }
@@ -54,7 +54,7 @@ function getStoredAuthToken(): string | null {
 
 function getStoredUser(): any | null {
   try {
-    const raw = sessionStorage.getItem('recordbook_user') || localStorage.getItem('recordbook_user');
+    const raw = sessionStorage.getItem('recordbook_user');
     return raw ? JSON.parse(raw) : null;
   } catch {
     return null;

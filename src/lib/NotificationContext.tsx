@@ -57,7 +57,7 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
     return [
       {
         id: 'sys-welcome',
-        title: 'AG Trust Record Book v2.9.3 Active',
+        title: 'AG Trust Record Book v2.9.4 beta Active',
         message: 'Advanced History Filters, Automated Daily Backup Cron, and Immutable Link Sync enabled.',
         type: 'success',
         timestamp: new Date().toISOString(),

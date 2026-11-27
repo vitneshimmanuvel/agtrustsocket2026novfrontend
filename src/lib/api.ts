@@ -162,9 +162,7 @@ const CLIENT_SESSION_ID = typeof window !== 'undefined'
 export function getAuthHeaders(extra?: Record<string, string>): Record<string, string> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json', ...(extra || {}) };
   try {
-    const token =
-      (typeof sessionStorage !== 'undefined' ? sessionStorage.getItem('recordbook_token') : null) ||
-      (typeof localStorage !== 'undefined' ? localStorage.getItem('recordbook_token') : null);
+    const token = typeof sessionStorage !== 'undefined' ? sessionStorage.getItem('recordbook_token') : null;
     if (token) headers['Authorization'] = `Bearer ${token}`;
   } catch {}
   return headers;
@@ -172,9 +170,7 @@ export function getAuthHeaders(extra?: Record<string, string>): Record<string, s
 
 function getStoredUser(): any {
   try {
-    const raw =
-      (typeof sessionStorage !== 'undefined' ? sessionStorage.getItem('recordbook_user') : null) ||
-      (typeof localStorage !== 'undefined' ? localStorage.getItem('recordbook_user') : null);
+    const raw = typeof sessionStorage !== 'undefined' ? sessionStorage.getItem('recordbook_user') : null;
     return raw ? JSON.parse(raw) : null;
   } catch {
     return null;

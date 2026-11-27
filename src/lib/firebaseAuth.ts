@@ -278,9 +278,7 @@ export async function firebaseChangePassword(token: string, currentPassword: str
 function authHeaders(): Record<string, string> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   try {
-    const token =
-      (typeof sessionStorage !== 'undefined' ? sessionStorage.getItem('recordbook_token') : null) ||
-      (typeof localStorage !== 'undefined' ? localStorage.getItem('recordbook_token') : null);
+    const token = typeof sessionStorage !== 'undefined' ? sessionStorage.getItem('recordbook_token') : null;
     if (token) headers['Authorization'] = `Bearer ${token}`;
   } catch {}
   return headers;
